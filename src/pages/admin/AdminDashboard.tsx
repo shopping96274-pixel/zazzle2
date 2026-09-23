@@ -1047,18 +1047,55 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
   };
 
   const handleDeleteAndResetChat = (convId: string) => {
-    const targetConv = unifiedConversations.find((c) => c.id === convId || (c as any).allConvIds?.includes(convId));
-    if (targetConv && (targetConv as any).allConvIds && (targetConv as any).allConvIds.length > 0) {
-      (targetConv as any).allConvIds.forEach((id: string) => deleteConversationAndReset(id));
-    } else {
-      deleteConversationAndReset(convId);
+    // 1. Immediately empty local live messages state so screen blanks out instantly
+    setLiveChatMessages([]);
+
+    // 2. Gather all candidate IDs associated with this thread / seller
+    const targetConv = unifiedConversations.find(
+      (c) => c.id === convId || (c as any).allConvIds?.includes(convId)
+    );
+    const allIds = new Set<string>();
+    if (convId) allIds.add(convId);
+    if (activeConvId) allIds.add(activeConvId);
+    if (targetConv) {
+      if (targetConv.id) allIds.add(targetConv.id);
+      if (targetConv.participantOneId) allIds.add(targetConv.participantOneId);
+      if (targetConv.participantTwoId) allIds.add(targetConv.participantTwoId);
+      if ((targetConv as any).sellerMatch?.id) allIds.add((targetConv as any).sellerMatch.id);
+      if ((targetConv as any).sellerMatch?.userId) allIds.add((targetConv as any).sellerMatch.userId);
+      if ((targetConv as any).allConvIds && Array.isArray((targetConv as any).allConvIds)) {
+        (targetConv as any).allConvIds.forEach((id: string) => allIds.add(id));
+      }
     }
+
+    const candidateList = Array.from(allIds).filter(Boolean);
+    deleteConversationAndReset(convId, candidateList);
+
     setDeleteConfirmConvId(null);
     triggerToast('Chat history cleared. You can manually type and send a reply.');
   };
 
   const handleDeleteSingleMsg = (msgId: string) => {
-    deleteSingleMessage(msgId, activeConvId || undefined);
+    // 1. Immediately drop message from local live state so it disappears instantly
+    setLiveChatMessages((prev) => prev.filter((m) => m.id !== msgId));
+
+    // 2. Gather candidate IDs
+    const currentActiveConv =
+      unifiedConversations.find((c) => c.id === activeConvId || (c as any).allConvIds?.includes(activeConvId)) ||
+      filteredConversations[0];
+
+    const extraCandidateIds: string[] = [];
+    if (activeConvId) extraCandidateIds.push(activeConvId);
+    if (currentActiveConv) {
+      if ((currentActiveConv as any).allConvIds) extraCandidateIds.push(...(currentActiveConv as any).allConvIds);
+      if (currentActiveConv.id) extraCandidateIds.push(currentActiveConv.id);
+      if (currentActiveConv.participantOneId) extraCandidateIds.push(currentActiveConv.participantOneId);
+      if (currentActiveConv.participantTwoId) extraCandidateIds.push(currentActiveConv.participantTwoId);
+      if ((currentActiveConv as any).sellerMatch?.id) extraCandidateIds.push((currentActiveConv as any).sellerMatch.id);
+      if ((currentActiveConv as any).sellerMatch?.userId) extraCandidateIds.push((currentActiveConv as any).sellerMatch.userId);
+    }
+
+    deleteSingleMessage(msgId, activeConvId || undefined, Array.from(new Set(extraCandidateIds)));
     triggerToast('Message deleted');
   };
 

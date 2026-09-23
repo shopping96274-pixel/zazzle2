@@ -311,8 +311,8 @@ interface StoreContextType {
   ) => Message;
   startOrGetSupportConversation: (userId: string, userName: string, userRole: UserRole) => Conversation;
   markConversationAsRead: (conversationId: string, readerRole: UserRole) => void;
-  deleteSingleMessage: (messageId: string, convId?: string) => void;
-  deleteConversationAndReset: (conversationId: string) => void;
+  deleteSingleMessage: (messageId: string, convId?: string, extraCandidateIds?: string[]) => void;
+  deleteConversationAndReset: (conversationId: string, extraCandidateIds?: string[]) => void;
   deleteEntireConversation: (conversationId: string) => void;
   sendChatMessage: typeof sendChatMessage;
   listenToChatMessages: typeof listenToChatMessages;
@@ -1397,6 +1397,36 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             }
           } else if (event.data?.type === 'MESSAGE_DELETED' && event.data.messageId) {
             setMessages((prev) => prev.filter((m) => m.id !== event.data.messageId));
+          } else if (event.data?.type === 'CONVERSATION_RESET') {
+            const rawIds: string[] = event.data.candidateIds || (event.data.conversationId ? [event.data.conversationId] : []);
+            const idsSet = new Set<string>();
+            rawIds.forEach((id) => {
+              const clean = id.startsWith('conv_') ? id.replace(/^conv_/, '') : id;
+              idsSet.add(id);
+              idsSet.add(clean);
+              idsSet.add(`conv_${clean}`);
+            });
+            setMessages((prev) =>
+              prev.filter((m) => {
+                if (idsSet.has(m.conversationId)) return false;
+                if (m.senderId && idsSet.has(m.senderId)) return false;
+                if ((m as any).receiverId && idsSet.has((m as any).receiverId)) return false;
+                return true;
+              })
+            );
+            setConversations((prev) =>
+              prev.map((c) =>
+                idsSet.has(c.id)
+                  ? {
+                      ...c,
+                      lastMessageText: '',
+                      lastMessageTime: new Date().toISOString(),
+                      unreadCountParticipantOne: 0,
+                      unreadCountParticipantTwo: 0,
+                    }
+                  : c
+              )
+            );
           } else if (event.data?.type === 'MESSAGES_READ' && event.data.conversationId) {
             setMessages((prev) =>
               prev.map((m) =>
@@ -6377,21 +6407,27 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     } catch {}
   };
 
-  const deleteSingleMessage = (messageId: string, convId?: string) => {
+  const deleteSingleMessage = (messageId: string, convId?: string, extraCandidateIds?: string[]) => {
     let targetConvId = convId || '';
+    const extraIds = new Set<string>(extraCandidateIds || []);
+
     setMessages((prev) => {
       const targetMsg = prev.find((m) => m.id === messageId);
-      if (targetMsg && !targetConvId) {
-        targetConvId = targetMsg.conversationId;
+      if (targetMsg) {
+        if (!targetConvId) targetConvId = targetMsg.conversationId;
+        if (targetMsg.conversationId) extraIds.add(targetMsg.conversationId);
+        if (targetMsg.senderId) extraIds.add(targetMsg.senderId);
+        if ((targetMsg as any).receiverId) extraIds.add((targetMsg as any).receiverId);
       }
       const updated = prev.filter((m) => m.id !== messageId);
 
-      if (targetConvId) {
-        const remaining = updated.filter((m) => m.conversationId === targetConvId);
+      const allIds = Array.from(new Set([targetConvId, ...Array.from(extraIds)])).filter(Boolean);
+      allIds.forEach((cid) => {
+        const remaining = updated.filter((m) => m.conversationId === cid);
         const lastMsg = remaining[remaining.length - 1];
         setConversations((cPrev) =>
           cPrev.map((c) => {
-            if (c.id === targetConvId) {
+            if (c.id === cid || c.id === `conv_${cid}` || c.id === cid.replace('conv_', '')) {
               return {
                 ...c,
                 lastMessageText: lastMsg ? (lastMsg.text || 'Attachment') : '',
@@ -6401,17 +6437,16 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             return c;
           })
         );
-      }
+      });
 
       return updated;
     });
 
-    // Sync deletion to Firestore
-    if (targetConvId) {
-      deleteChatMessage(targetConvId, messageId).catch((err) =>
-        console.warn('[Firestore] Error deleting chat message:', err)
-      );
-    }
+    // Sync deletion to Firestore across all candidate IDs
+    const candidateList = Array.from(new Set([targetConvId, ...Array.from(extraIds)])).filter(Boolean);
+    deleteChatMessage(targetConvId || candidateList[0] || '', messageId, candidateList).catch((err) =>
+      console.warn('[Firestore] Error deleting chat message:', err)
+    );
 
     // Broadcast deletion across local tabs
     try {
@@ -6421,20 +6456,37 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           type: 'MESSAGE_DELETED',
           messageId,
           conversationId: targetConvId,
+          candidateIds: candidateList,
         });
         bc.close();
       }
     } catch {}
   };
 
-  const deleteConversationAndReset = (conversationId: string) => {
+  const deleteConversationAndReset = (conversationId: string, extraCandidateIds?: string[]) => {
+    const rawIds = [conversationId, ...(extraCandidateIds || [])].map((id) => (id || '').trim()).filter(Boolean);
+    const candidateSet = new Set<string>();
+    rawIds.forEach((id) => {
+      const clean = id.startsWith('conv_') ? id.replace(/^conv_/, '') : id;
+      candidateSet.add(id);
+      candidateSet.add(clean);
+      candidateSet.add(`conv_${clean}`);
+    });
+
     // Remove all previous messages for this conversation with no auto-reply
-    setMessages((prev) => prev.filter((m) => m.conversationId !== conversationId && m.conversationId !== `conv_${conversationId}` && m.conversationId !== conversationId.replace('conv_', '')));
+    setMessages((prev) =>
+      prev.filter((m) => {
+        if (candidateSet.has(m.conversationId)) return false;
+        if (m.senderId && candidateSet.has(m.senderId)) return false;
+        if ((m as any).receiverId && candidateSet.has((m as any).receiverId)) return false;
+        return true;
+      })
+    );
 
     // Update conversation metadata to cleared state
     setConversations((prev) =>
       prev.map((c) => {
-        if (c.id === conversationId || c.id === `conv_${conversationId}` || c.id === conversationId.replace('conv_', '')) {
+        if (candidateSet.has(c.id)) {
           return {
             ...c,
             lastMessageText: '',
@@ -6448,7 +6500,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     );
 
     // Permanently wipe all messages in this conversation from Firestore
-    deleteAllChatMessages(conversationId).catch((err) =>
+    deleteAllChatMessages(conversationId, Array.from(candidateSet)).catch((err) =>
       console.warn('[Firestore] Error resetting conversation messages:', err)
     );
 
@@ -6459,6 +6511,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         bc.postMessage({
           type: 'CONVERSATION_RESET',
           conversationId,
+          candidateIds: Array.from(candidateSet),
         });
         bc.close();
       }

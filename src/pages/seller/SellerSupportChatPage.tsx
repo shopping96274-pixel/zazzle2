@@ -176,6 +176,24 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
     return () => unsub();
   }, [sellerIdentifier, listenToChatMessages]);
 
+  // Instant broadcast listener for deletions & resets across tabs
+  useEffect(() => {
+    if (typeof BroadcastChannel === 'undefined') return;
+    const bc = new BroadcastChannel('nexus_chat_channel');
+    bc.onmessage = (event) => {
+      if (event.data?.type === 'MESSAGE_DELETED' && event.data.messageId) {
+        setRealtimeMessages((prev) => prev.filter((m) => m.id !== event.data.messageId));
+      } else if (event.data?.type === 'CONVERSATION_RESET') {
+        setRealtimeMessages([]);
+      }
+    };
+    return () => {
+      try {
+        bc.close();
+      } catch {}
+    };
+  }, []);
+
   // Filter & merge messages for this conversation
   const conversationMessages = React.useMemo(() => {
     const map = new Map<string, any>();
