@@ -1,6 +1,6 @@
 import { initializeApp, getApps, getApp, FirebaseApp } from 'firebase/app';
 import { getAuth, Auth } from 'firebase/auth';
-import { initializeFirestore, getFirestore, Firestore } from 'firebase/firestore';
+import { initializeFirestore, getFirestore, Firestore, setLogLevel } from 'firebase/firestore';
 import { getStorage, FirebaseStorage } from 'firebase/storage';
 import firebaseConfigJson from '../../firebase-applet-config.json';
 
@@ -47,16 +47,25 @@ if (getApps().length === 0) {
   app = getApp();
 }
 
+// Silence internal Firestore SDK connection retry warnings so transient network state transitions
+// do not trigger false-positive console error intercepts in preview iframes
+try {
+  setLogLevel('silent');
+} catch {}
+
 // Auth instance
 export const auth: Auth = getAuth(app);
 
 // Firestore instance (with databaseId support if custom, or default)
-// Initialize with experimentalForceLongPolling to ensure reliable connections through proxies,
-// preview iframes, and network environments where standard streaming WebChannel connections fail.
+// Initialize with experimentalAutoDetectLongPolling and extended timeout to allow fast streaming
+// WebChannel connections first, seamlessly falling back to long-polling only when required.
 let firestoreDb: Firestore;
 try {
   const settings = {
-    experimentalForceLongPolling: true,
+    experimentalAutoDetectLongPolling: true,
+    experimentalLongPollingOptions: {
+      timeoutSeconds: 30,
+    },
   };
   firestoreDb =
     FIRESTORE_DATABASE_ID && FIRESTORE_DATABASE_ID !== '(default)'

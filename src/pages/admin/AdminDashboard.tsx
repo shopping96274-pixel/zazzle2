@@ -1201,9 +1201,15 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
 
   const handleSaveEditedOrderStatus = () => {
     if (!editingAssignedOrder) return;
-    updateOrderStatus(editingAssignedOrder.id, orderStatusChangeVal, orderStatusChangeNote || undefined);
-    if (orderEditDateTime && orderEditDateTime.trim()) {
-      updateOrderDate(editingAssignedOrder.id, orderEditDateTime);
+    const dateToPass = orderEditDateTime && orderEditDateTime.trim() ? orderEditDateTime.trim() : undefined;
+    updateOrderStatus(
+      editingAssignedOrder.id,
+      orderStatusChangeVal,
+      orderStatusChangeNote || undefined,
+      dateToPass
+    );
+    if (dateToPass) {
+      updateOrderDate(editingAssignedOrder.id, dateToPass);
     }
     triggerToast(`Order #${editingAssignedOrder.id} updated!`);
     setEditingAssignedOrder(null);

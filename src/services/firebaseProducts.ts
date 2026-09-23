@@ -16,6 +16,9 @@ import { Product, Category } from '../types';
 const PRODUCTS_COLLECTION = 'products';
 const CATEGORIES_COLLECTION = 'categories';
 const DELETED_PRODUCTS_KEY = 'nexus_deleted_product_ids';
+const PRODUCTS_CACHE_KEY = 'nexus_products_cache_v2';
+const CATEGORIES_CACHE_KEY = 'nexus_categories_cache_v2';
+const CACHE_TTL_MS = 20 * 60 * 1000; // 20 minutes client-side cache
 
 /**
  * Check if a product has been permanently deleted by admin
@@ -46,13 +49,164 @@ export function recordDeletedProductId(productId: string): void {
 }
 
 /**
- * Persist or update a product document in Firestore
+ * Unmarks a product ID from deleted status so seller or admin can re-add it without any constraint
+ */
+export function unmarkDeletedProductId(productId: string): void {
+  try {
+    const raw = localStorage.getItem(DELETED_PRODUCTS_KEY);
+    if (!raw) return;
+    const list: string[] = JSON.parse(raw);
+    const updated = list.filter((id) => id !== productId);
+    localStorage.setItem(DELETED_PRODUCTS_KEY, JSON.stringify(updated));
+  } catch {}
+}
+
+/**
+ * Broadcasts catalog modifications to all browser tabs so they update immediately without re-fetching from Firestore
+ */
+export function broadcastCatalogUpdate(action: string, payload?: any): void {
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      const bc = new BroadcastChannel('nexus_catalog_sync');
+      bc.postMessage({ type: 'CATALOG_SYNC', action, payload, timestamp: Date.now() });
+      setTimeout(() => bc.close(), 1000);
+    }
+  } catch {}
+}
+
+/**
+ * Updates or invalidates the local products cache
+ */
+export function invalidateProductsCache(updatedProducts?: Product[]): void {
+  try {
+    if (updatedProducts && Array.isArray(updatedProducts)) {
+      localStorage.setItem(
+        PRODUCTS_CACHE_KEY,
+        JSON.stringify({ timestamp: Date.now(), products: updatedProducts })
+      );
+    } else {
+      localStorage.removeItem(PRODUCTS_CACHE_KEY);
+    }
+    broadcastCatalogUpdate('INVALIDATE_PRODUCTS', { hasUpdatedProducts: Boolean(updatedProducts) });
+  } catch {}
+}
+
+/**
+ * Hybrid Fetch: Retrieves products from local cache if fresh (<20 mins), or performs a single getDocs fetch.
+ * Drastically reduces Firestore reads (saving quota for 500+ daily visitors).
+ */
+export async function fetchCachedFirestoreProducts(forceRefresh = false): Promise<Product[] | null> {
+  // 1. Check local cache first
+  if (!forceRefresh) {
+    try {
+      const raw = localStorage.getItem(PRODUCTS_CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (
+          parsed &&
+          Array.isArray(parsed.products) &&
+          parsed.products.length > 0 &&
+          Date.now() - (parsed.timestamp || 0) < CACHE_TTL_MS
+        ) {
+          // Return non-deleted cached products
+          return parsed.products.filter((p: Product) => !isProductDeleted(p.id));
+        }
+      }
+    } catch {}
+  }
+
+  // 2. Single getDocs read from Firestore (only when cache missing, expired, or force refresh)
+  if (!db) return null;
+  try {
+    const colRef = collection(db, PRODUCTS_COLLECTION);
+    const snapshot = await getDocs(colRef);
+    if (!snapshot.empty) {
+      const loadedProducts: Product[] = [];
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data() as Product;
+        const pid = docSnap.id || data.id;
+        if (!isProductDeleted(pid)) {
+          loadedProducts.push({
+            ...data,
+            id: pid,
+          });
+        }
+      });
+
+      // Save to cache
+      try {
+        localStorage.setItem(
+          PRODUCTS_CACHE_KEY,
+          JSON.stringify({ timestamp: Date.now(), products: loadedProducts })
+        );
+      } catch {}
+
+      return loadedProducts;
+    }
+  } catch (err) {
+    console.warn('[Firestore] Single getDocs products fetch error (offline fallback):', err);
+  }
+  return null;
+}
+
+/**
+ * Hybrid Fetch: Retrieves categories from local cache if fresh, or performs a single getDocs fetch.
+ */
+export async function fetchCachedFirestoreCategories(forceRefresh = false): Promise<Category[] | null> {
+  if (!forceRefresh) {
+    try {
+      const raw = localStorage.getItem(CATEGORIES_CACHE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (
+          parsed &&
+          Array.isArray(parsed.categories) &&
+          parsed.categories.length > 0 &&
+          Date.now() - (parsed.timestamp || 0) < CACHE_TTL_MS
+        ) {
+          return parsed.categories;
+        }
+      }
+    } catch {}
+  }
+
+  if (!db) return null;
+  try {
+    const colRef = collection(db, CATEGORIES_COLLECTION);
+    const snapshot = await getDocs(colRef);
+    if (!snapshot.empty) {
+      const loadedCats: Category[] = [];
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data() as Category;
+        loadedCats.push({
+          ...data,
+          id: docSnap.id || data.id,
+        });
+      });
+
+      try {
+        localStorage.setItem(
+          CATEGORIES_CACHE_KEY,
+          JSON.stringify({ timestamp: Date.now(), categories: loadedCats })
+        );
+      } catch {}
+
+      return loadedCats;
+    }
+  } catch (err) {
+    console.warn('[Firestore] Single getDocs categories fetch error:', err);
+  }
+  return null;
+}
+
+/**
+ * Persist or update a product document in Firestore.
+ * Automatically lifts any previous soft-delete restriction so re-addition succeeds cleanly.
  */
 export async function saveProductToFirestore(product: Product): Promise<void> {
-  if (isProductDeleted(product.id)) {
-    console.log(`[Firestore] Skipping save of deleted product: ${product.id}`);
-    return;
-  }
+  // If this product was previously deleted, unmark it so it can be re-added without constraint
+  unmarkDeletedProductId(product.id);
+
   try {
     if (!db) return;
     const prodDocRef = doc(db, PRODUCTS_COLLECTION, product.id);
@@ -70,6 +224,24 @@ export async function saveProductToFirestore(product: Product): Promise<void> {
 
     await setDoc(prodDocRef, cleanProduct, { merge: true });
     console.log(`[Firestore] Product "${product.name}" (${product.id}) saved successfully.`);
+
+    // Smart Invalidation: update local cache with this product and broadcast to other tabs
+    try {
+      const raw = localStorage.getItem(PRODUCTS_CACHE_KEY);
+      let currentCacheProds: Product[] = raw ? JSON.parse(raw).products || [] : [];
+      const idx = currentCacheProds.findIndex((p) => p.id === product.id);
+      if (idx >= 0) {
+        currentCacheProds[idx] = product;
+      } else {
+        currentCacheProds.unshift(product);
+      }
+      localStorage.setItem(
+        PRODUCTS_CACHE_KEY,
+        JSON.stringify({ timestamp: Date.now(), products: currentCacheProds })
+      );
+    } catch {}
+
+    broadcastCatalogUpdate('PRODUCT_SAVED', { product });
   } catch (error) {
     console.warn(`[Firestore] Failed to save product ${product.id} to Firestore:`, error);
   }
@@ -108,6 +280,14 @@ export async function deleteProductFromFirestore(productId: string): Promise<voi
       const filtered = prods.filter((p) => p.id !== productId);
       localStorage.setItem('nexus_products', JSON.stringify(filtered));
     }
+    const cacheRaw = localStorage.getItem(PRODUCTS_CACHE_KEY);
+    if (cacheRaw) {
+      const parsed = JSON.parse(cacheRaw);
+      if (parsed && Array.isArray(parsed.products)) {
+        parsed.products = parsed.products.filter((p: Product) => p.id !== productId);
+        localStorage.setItem(PRODUCTS_CACHE_KEY, JSON.stringify(parsed));
+      }
+    }
     const rawCart = localStorage.getItem('nexus_cart');
     if (rawCart) {
       const cart = JSON.parse(rawCart);
@@ -118,6 +298,7 @@ export async function deleteProductFromFirestore(productId: string): Promise<voi
 
   // Broadcast deletion across open tabs
   try {
+    broadcastCatalogUpdate('PRODUCT_DELETED', { productId });
     if (typeof BroadcastChannel !== 'undefined') {
       const bc = new BroadcastChannel('nexus_products_channel');
       bc.postMessage({ type: 'PRODUCT_DELETED', productId });

@@ -297,12 +297,32 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
   // Chat state
   const [chatInput, setChatInput] = useState('');
 
-  // Find seller record for current user
+  // Find seller record for current user (strictly requiring authentication)
   const currentSeller =
     (currentUser?.id && currentUser.id !== 'guest_visitor' && sellers.find((s) => s.userId === currentUser.id || s.id === currentUser.id)) ||
     (currentUser?.email && sellers.find((s) => (s.email || '').toLowerCase() === currentUser.email.toLowerCase())) ||
-    sellers.find((s) => !s.id.includes('dummy') && !s.id.includes('default')) ||
-    sellers[0];
+    (() => {
+      try {
+        const sessionStr = localStorage.getItem('nexus_seller_session');
+        if (sessionStr) {
+          const sess = JSON.parse(sessionStr);
+          if (sess && sess.userId && Date.now() < (sess.expiresAt || Infinity)) {
+            return sellers.find((s) => s.userId === sess.userId || s.id === sess.userId) || null;
+          }
+        }
+      } catch {}
+      return null;
+    })() ||
+    null;
+
+  // Unauthenticated seller route protection
+  useEffect(() => {
+    if (!currentSeller) {
+      if (onNavigate) {
+        onNavigate('seller-login');
+      }
+    }
+  }, [currentSeller, onNavigate]);
 
   const isStoreFrozen =
     currentSeller?.applicationStatus === 'FROZEN' ||
@@ -1448,6 +1468,31 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
       !m.isRead &&
       m.senderId !== (currentSeller?.userId || currentUser.id)
   ).length;
+
+  if (!currentSeller) {
+    return (
+      <div className="min-h-screen bg-slate-950 py-8 px-4 flex flex-col items-center justify-center font-sans">
+        <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 shadow-2xl space-y-6 text-center animate-in fade-in zoom-in-95 duration-200">
+          <div className="w-16 h-16 mx-auto rounded-3xl bg-amber-400/15 border-2 border-amber-400/30 flex items-center justify-center text-amber-400">
+            <Lock className="w-8 h-8" />
+          </div>
+          <div className="space-y-2">
+            <h1 className="text-xl font-black text-white">Merchant Login Required</h1>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Direct access is protected. Please sign in with your verified seller account to open this dashboard.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => onNavigate && onNavigate('seller-login')}
+            className="w-full py-3.5 px-4 bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-300 hover:to-amber-400 text-slate-950 font-black rounded-2xl shadow-xl flex items-center justify-center gap-2 text-sm transition-all active:scale-[0.98] cursor-pointer"
+          >
+            <span>Proceed to Seller Login</span>
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (isStoreFrozen) {
     return (

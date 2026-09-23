@@ -327,11 +327,11 @@ export const HomePage: React.FC<HomePageProps> = ({ onNavigate, onSelectProduct 
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState<string>('all');
   const [selectedPriceFilter, setSelectedPriceFilter] = useState<'all' | 'under50' | 'under200' | 'under800' | 'under1500'>('all');
   const [catalogViewMode, setCatalogViewMode] = useState<'grid' | 'departments'>('grid');
-  const [visibleGridCount, setVisibleGridCount] = useState(12);
+  const [visibleGridCount, setVisibleGridCount] = useState(40);
 
   // Reset visible count when filter changes
   useEffect(() => {
-    setVisibleGridCount(12);
+    setVisibleGridCount(40);
   }, [selectedCategoryFilter, selectedPriceFilter]);
 
   const featuredScrollRef = useRef<HTMLDivElement>(null);
@@ -366,7 +366,16 @@ export const HomePage: React.FC<HomePageProps> = ({ onNavigate, onSelectProduct 
     return () => clearInterval(timer);
   }, []);
 
-  const publishedProducts = products.filter((p) => p.status === 'PUBLISHED');
+  const publishedProducts = useMemo(() => {
+    return [...products]
+      .filter((p) => p.status === 'PUBLISHED')
+      .sort((a, b) => {
+        const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+        const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+        if (timeB !== timeA) return timeB - timeA;
+        return (b.id || '').localeCompare(a.id || '');
+      });
+  }, [products]);
 
   // Apply price filter
   const priceFilteredProducts = publishedProducts.filter((p) => {
@@ -441,14 +450,14 @@ export const HomePage: React.FC<HomePageProps> = ({ onNavigate, onSelectProduct 
     const deals = publishedProducts.filter(
       (p) => p.featured || (p.originalPrice && p.originalPrice > p.price)
     );
-    if (deals.length >= 10) return deals.slice(0, 24);
+    if (deals.length >= 10) return deals.slice(0, 36);
     const combined = [...deals];
     publishedProducts.forEach((p) => {
       if (!combined.some((item) => item.id === p.id)) {
         combined.push(p);
       }
     });
-    return combined.slice(0, 24);
+    return combined.slice(0, 36);
   }, [publishedProducts]);
 
   // Products matching the active category filter for the direct storefront grid

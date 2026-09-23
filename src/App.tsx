@@ -24,6 +24,48 @@ import { purgeLegacyLocalStorageCredentials } from './services/adminAuth';
 // Immediately purge legacy admin credentials from local storage
 purgeLegacyLocalStorageCredentials();
 
+// Helper to check if a valid seller session exists in localStorage
+function hasActiveSellerSession(): boolean {
+  try {
+    const sessionStr = localStorage.getItem('nexus_seller_session');
+    if (sessionStr) {
+      const sess = JSON.parse(sessionStr);
+      if (sess && sess.role === 'SELLER' && sess.userId && Date.now() < (sess.expiresAt || Infinity)) {
+        return true;
+      }
+    }
+    const userStr = localStorage.getItem('nexus_current_user');
+    if (userStr) {
+      const u = JSON.parse(userStr);
+      if (u && u.role === 'SELLER' && u.id && u.id !== 'guest_visitor') {
+        return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+
+// Helper to check if user has active admin session
+function hasActiveAdminSession(): boolean {
+  try {
+    const adminSess = localStorage.getItem('nexus_admin_session') || sessionStorage.getItem('nexus_admin_session');
+    if (adminSess) {
+      const parsed = JSON.parse(adminSess);
+      if (parsed && (parsed.role === 'ADMIN' || parsed.isAdmin) && Date.now() < (parsed.expiresAt || Infinity)) {
+        return true;
+      }
+    }
+    const userStr = localStorage.getItem('nexus_current_user');
+    if (userStr) {
+      const u = JSON.parse(userStr);
+      if (u && u.role === 'ADMIN') {
+        return true;
+      }
+    }
+  } catch {}
+  return false;
+}
+
 // Helper to detect if current URL/hash points specifically to admin
 function isUrlAdminRoute(): boolean {
   try {
@@ -51,9 +93,34 @@ function isUrlAdminRoute(): boolean {
       decodedPath = decodeURIComponent(pathname);
     } catch {}
 
-    // Check for *#**##x pattern in any part of URL/link
+    // Reject standard, predictable admin paths (/admin, /admin/dashboard, #admin, ?admin=true)
+    // These paths are deliberately blocked from unauthenticated public access.
+    const isStandardAdminPath =
+      pathname === '/admin' ||
+      pathname.startsWith('/admin/') ||
+      hash === '#admin' ||
+      hash === '#/admin' ||
+      hash.startsWith('#/admin/') ||
+      hash.startsWith('#admin/') ||
+      search.includes('admin=true') ||
+      search.includes('admin=1') ||
+      search.includes('view=admin');
+
+    if (isStandardAdminPath) {
+      // Only allow if user already has an authenticated admin session
+      if (hasActiveAdminSession()) {
+        return true;
+      }
+      // Otherwise bounce to home cleanly
+      try {
+        window.history.replaceState(null, '', '/');
+      } catch {}
+      return false;
+    }
+
+    // Check for unique, secret token-based protected route pattern (*#**##x)
     const secretCode = '*#**##x';
-    const isSecretPresent =
+    const isSecretTokenPresent =
       rawHref.includes(secretCode) ||
       decodedHref.includes(secretCode) ||
       hash.includes(secretCode) ||
@@ -61,30 +128,16 @@ function isUrlAdminRoute(): boolean {
       pathname.includes(secretCode) ||
       decodedPath.includes(secretCode) ||
       search.includes(secretCode) ||
-      // In case browser treats /*#**##x as path "/*" and hash "#**##x"
       (pathname.includes('*') && hash.includes('**##x')) ||
       rawHref.includes('%2a#%2a%2a##x') ||
       rawHref.includes('*%23**%23%23x') ||
       rawHref.includes('%2a%23%2a%2a%23%23x');
 
-    if (isSecretPresent) {
+    if (isSecretTokenPresent) {
       return true;
     }
 
-    return (
-      pathname === '/admin' ||
-      pathname.startsWith('/admin/') ||
-      hash === '#/*#**##x' ||
-      hash === '#*#**##x' ||
-      hash === '#/96274' ||
-      hash === '#96274' ||
-      hash.includes('96274') ||
-      hash === '#admin' ||
-      hash === '#/admin' ||
-      search.includes('admin=true') ||
-      search.includes('admin=1') ||
-      search.includes('view=admin')
-    );
+    return false;
   } catch {
     return false;
   }
@@ -100,8 +153,25 @@ function getViewFromLocation(): string {
     const pathname = window.location.pathname.toLowerCase();
     const search = window.location.search.toLowerCase();
 
+    // Seller route protection: if direct link pasted in another browser/window without valid session,
+    // immediately direct to seller-login!
     if (hash === '#seller' || hash === '#/seller' || pathname === '/seller' || search.includes('view=seller')) {
+      if (!hasActiveSellerSession()) {
+        try {
+          window.history.replaceState({ view: 'seller-login' }, '', '#/seller-login');
+        } catch {}
+        return 'seller-login';
+      }
       return 'seller';
+    }
+    if (hash === '#seller-support' || hash === '#/seller-support' || pathname === '/seller-support' || search.includes('view=seller-support')) {
+      if (!hasActiveSellerSession()) {
+        try {
+          window.history.replaceState({ view: 'seller-login' }, '', '#/seller-login');
+        } catch {}
+        return 'seller-login';
+      }
+      return 'seller-support';
     }
     if (hash === '#become-seller' || hash === '#/become-seller' || pathname === '/become-seller' || search.includes('view=become-seller')) {
       return 'become-seller';
@@ -269,8 +339,17 @@ function MainAppContent() {
     };
   }, []);
 
+  // Check if seller is legitimately authenticated
+  const isSellerAuth = Boolean(
+    (currentUser && currentUser.role === 'SELLER' && currentUser.id && currentUser.id !== 'guest_visitor') ||
+    hasActiveSellerSession()
+  );
+
   // Check if current seller is unverified or frozen
   const activeSellerProfile = useMemo(() => {
+    // If not authenticated as seller, NEVER provide a fallback seller profile
+    if (!isSellerAuth) return null;
+
     // 1. Check logged-in user matching seller by id or email
     if (currentUser && currentUser.id && currentUser.id !== 'guest_visitor') {
       const match = sellers.find(
@@ -304,13 +383,18 @@ function MainAppContent() {
       }
     } catch {}
 
-    // 3. If currently in seller views ('seller', 'seller-support'), get current active seller
-    if (currentView === 'seller' || currentView === 'seller-support') {
-      return sellers.find((s) => s && !s.id.includes('dummy') && !s.id.includes('default')) || sellers[0] || null;
-    }
-
     return null;
-  }, [currentUser, sellers, currentView]);
+  }, [currentUser, sellers, isSellerAuth]);
+
+  // Enforce route protection on seller views
+  useEffect(() => {
+    if ((currentView === 'seller' || currentView === 'seller-support') && !isSellerAuth) {
+      setCurrentView('seller-login');
+      try {
+        window.history.replaceState({ view: 'seller-login' }, '', '#/seller-login');
+      } catch {}
+    }
+  }, [currentView, isSellerAuth]);
 
   const isSellerUnverified = Boolean(
     currentUser.role === 'SELLER' &&
@@ -353,6 +437,11 @@ function MainAppContent() {
 
   // Router handler with full browser history pushState support
   const handleNavigate = (view: string, id?: string) => {
+    // If attempting to enter seller routes without seller authentication, route to seller-login
+    if ((view === 'seller' || view === 'seller-support') && !isSellerAuth) {
+      view = 'seller-login';
+    }
+
     // If seller is frozen, restrict all navigation strictly to customer care chat
     if (isSellerFrozen && view !== 'seller-support' && view !== 'admin') {
       setCurrentView('seller-support');

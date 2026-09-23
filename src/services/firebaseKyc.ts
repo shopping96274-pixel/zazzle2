@@ -1077,11 +1077,11 @@ export function listenToFirestoreOrders(
       (snapshot) => {
         const firestoreOrders: any[] = [];
         snapshot.forEach((docSnap) => {
-          firestoreOrders.push({ id: docSnap.id, ...docSnap.data() });
+          if (!isOrderDeleted(docSnap.id)) {
+            firestoreOrders.push({ id: docSnap.id, ...docSnap.data() });
+          }
         });
-        if (firestoreOrders.length > 0) {
-          onUpdate(firestoreOrders);
-        }
+        onUpdate(firestoreOrders);
       },
       (err) => {
         console.warn('[Firestore] Orders subscription notice:', err);

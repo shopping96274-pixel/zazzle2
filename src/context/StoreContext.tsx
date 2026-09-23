@@ -72,6 +72,8 @@ import {
   listenToFirestoreWithdrawals,
   fetchAllFirestoreWithdrawals,
   getFirestorePermissionStatus,
+  isOrderDeleted,
+  recordDeletedOrderId,
 } from '../services/firebaseKyc';
 import { playNotificationBeep } from '../utils/audioAlert';
 import {
@@ -106,6 +108,12 @@ import {
   listenToFirestoreProducts,
   listenToFirestoreCategories,
   seedInitialFirestoreCatalog,
+  fetchCachedFirestoreProducts,
+  fetchCachedFirestoreCategories,
+  invalidateProductsCache,
+  unmarkDeletedProductId,
+  isProductDeleted,
+  recordDeletedProductId,
 } from '../services/firebaseProducts';
 import {
   saveSellerLoginSession,
@@ -241,7 +249,7 @@ interface StoreContextType {
   }) => Order;
   assignOrderToSeller: (orderId: string, sellerId: string, customAssignedAt?: string) => void;
   updateOrderDate: (orderId: string, newDateIsoOrString: string) => void;
-  updateOrderStatus: (orderId: string, newStatus: OrderStatus, note?: string) => void;
+  updateOrderStatus: (orderId: string, newStatus: OrderStatus, note?: string, newDateIsoOrString?: string) => void;
   deleteOrder: (orderId: string) => void;
 
   // Wallets & Financials
@@ -1745,15 +1753,14 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     // 1. Initial Firestore seed if empty
     seedInitialFirestoreCatalog(INITIAL_PRODUCTS, INITIAL_CATEGORIES);
 
-    // 2. Real-time Firestore sync for products
-    const unsubProds = listenToFirestoreProducts((liveProds) => {
-      if (liveProds && liveProds.length > 0) {
-        // Sanitize every product from Firestore to prevent runtime crashes
-        const sanitizedLive = liveProds.map(safeSanitizeProduct);
+    // 2. Hybrid Caching & Single Fetch for Products (Quota Saving)
+    fetchCachedFirestoreProducts().then((loadedProds) => {
+      if (loadedProds && loadedProds.length > 0) {
+        const sanitizedLive = loadedProds.map(safeSanitizeProduct).filter((p) => !isProductDeleted(p.id));
         const liveMap = new Map(sanitizedLive.map((p) => [p.id, p]));
         const merged = [...sanitizedLive];
         for (const initP of INITIAL_PRODUCTS) {
-          if (!liveMap.has(initP.id)) {
+          if (!liveMap.has(initP.id) && !isProductDeleted(initP.id)) {
             merged.push(initP);
           }
         }
@@ -1767,13 +1774,65 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
     });
 
-    // 3. Real-time Firestore sync for categories
-    const unsubCats = listenToFirestoreCategories((liveCats) => {
-      if (liveCats && liveCats.length > 0) {
-        const sanitizedCats = liveCats.map(safeSanitizeCategory);
+    // 3. Hybrid Caching & Single Fetch for Categories
+    fetchCachedFirestoreCategories().then((loadedCats) => {
+      if (loadedCats && loadedCats.length > 0) {
+        const sanitizedCats = loadedCats.map(safeSanitizeCategory);
         setCategories(sanitizedCats);
       }
     });
+
+    // Cross-tab live sync for catalog and orders
+    let catalogSyncChannel: BroadcastChannel | null = null;
+    let orderSyncChannel: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        catalogSyncChannel = new BroadcastChannel('nexus_catalog_sync');
+        catalogSyncChannel.onmessage = (event) => {
+          const { action, payload } = event.data || {};
+          if (action === 'PRODUCT_SAVED' && payload?.product) {
+            setProducts((prev) => {
+              const updatedProd = safeSanitizeProduct(payload.product);
+              const exists = prev.some((p) => p.id === updatedProd.id);
+              const next = exists
+                ? prev.map((p) => (p.id === updatedProd.id ? updatedProd : p))
+                : [updatedProd, ...prev];
+              return next.sort((a, b) => {
+                const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+                const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+                return timeB - timeA;
+              });
+            });
+          } else if (action === 'PRODUCT_DELETED' && payload?.productId) {
+            setProducts((prev) => prev.filter((p) => p.id !== payload.productId));
+            setCart((prev) => prev.filter((item) => item.product.id !== payload.productId));
+            setSellers((prev) =>
+              prev.map((s) => ({
+                ...s,
+                selectedProductIds: (s.selectedProductIds || []).filter((id) => id !== payload.productId),
+              }))
+            );
+          } else if (action === 'INVALIDATE_PRODUCTS') {
+            fetchCachedFirestoreProducts(true).then((freshProds) => {
+              if (freshProds && freshProds.length > 0) {
+                setProducts(freshProds.map(safeSanitizeProduct).filter((p) => !isProductDeleted(p.id)));
+              }
+            });
+          }
+        };
+
+        orderSyncChannel = new BroadcastChannel('nexus_order_channel');
+        orderSyncChannel.onmessage = (event) => {
+          const { type, orderId } = event.data || {};
+          if (type === 'ORDER_DELETED' && orderId) {
+            setOrders((prev) => prev.filter((o) => o.id !== orderId));
+          }
+        };
+      }
+    } catch {}
+
+    const unsubProds = () => {};
+    const unsubCats = () => {};
 
     // 4. Real-time Firestore sync for sellers (Instant reflection on Admin panel & persistent login)
     fetchAllFirestoreSellers().then((bootSellers) => {
@@ -1943,15 +2002,12 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     // 6. Real-time Firestore sync for orders
     const unsubOrders = listenToFirestoreOrders((liveOrders) => {
-      if (liveOrders && liveOrders.length > 0) {
+      if (Array.isArray(liveOrders)) {
         setOrders((prev) => {
-          const prevMap = new Map<string, Order>(prev.map((o) => [o.id, o]));
-          liveOrders.forEach((lo: any) => {
-            if (!lo || !lo.id) return;
-            const existingOrder = prevMap.get(lo.id);
-            prevMap.set(lo.id, existingOrder ? { ...existingOrder, ...lo } : (lo as Order));
-          });
-          const merged = Array.from(prevMap.values()).sort(
+          const filtered = liveOrders.filter((lo: any) => lo && lo.id && !isOrderDeleted(lo.id));
+          const liveIds = new Set(filtered.map((o) => o.id));
+          const localOnly = prev.filter((p) => !liveIds.has(p.id) && !isOrderDeleted(p.id));
+          const merged = [...filtered, ...localOnly].sort(
             (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
           );
           safeSave('nexus_orders', merged);
@@ -3762,8 +3818,28 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const deleteProduct = (id: string) => {
-    setProducts((prev) => prev.filter((p) => p.id !== id));
-    setCart((prev) => prev.filter((item) => item.product.id !== id));
+    recordDeletedProductId(id);
+    setProducts((prev) => {
+      const next = prev.filter((p) => p.id !== id);
+      try {
+        localStorage.setItem('nexus_products', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+    setCart((prev) => {
+      const next = prev.filter((item) => item.product.id !== id);
+      try {
+        localStorage.setItem('nexus_cart', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+    // Remove from all sellers' selected lists immediately
+    setSellers((prev) =>
+      prev.map((s) => ({
+        ...s,
+        selectedProductIds: (s.selectedProductIds || []).filter((pid) => pid !== id),
+      }))
+    );
     deleteProductFromFirestore(id);
   };
 
@@ -3785,6 +3861,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   };
 
   const toggleSellerProductEligibility = (productId: string, sellerId: string) => {
+    // Unmark deleted product id so re-adding works seamlessly without constraints
+    unmarkDeletedProductId(productId);
+
     const matchingSeller = sellers.find(
       (s) => s.id === sellerId || s.userId === sellerId || (s.email && s.email.toLowerCase() === sellerId.toLowerCase())
     );
@@ -4208,8 +4287,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
     } catch {}
 
-    setOrders((prev) =>
-      prev.map((o) => {
+    setOrders((prev) => {
+      const next = prev.map((o) => {
         if (o.id === orderId) {
           const updatedTimeline = [
             ...o.timeline,
@@ -4233,13 +4312,23 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           return updated;
         }
         return o;
-      })
-    );
+      });
+      safeSave('nexus_orders', next);
+      try {
+        localStorage.setItem('nexus_orders', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
   };
 
-  const updateOrderStatus = (orderId: string, newStatus: OrderStatus, note?: string) => {
-    setOrders((prev) =>
-      prev.map((o) => {
+  const updateOrderStatus = (
+    orderId: string,
+    newStatus: OrderStatus,
+    note?: string,
+    newDateIsoOrString?: string
+  ) => {
+    setOrders((prev) => {
+      const next = prev.map((o) => {
         if (o.id === orderId) {
           const actorName =
             currentUser.role === 'ADMIN'
@@ -4769,16 +4858,28 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             '/customer/orders'
           );
 
+          let targetDateIso: string | undefined = undefined;
+          if (newDateIsoOrString && newDateIsoOrString.trim()) {
+            try {
+              const d = new Date(newDateIsoOrString);
+              if (!isNaN(d.getTime())) {
+                targetDateIso = d.toISOString();
+              }
+            } catch {}
+          }
+
           const updatedOrder: Order = {
             ...o,
             status: newStatus,
+            createdAt: targetDateIso || o.createdAt,
+            assignedAt: (targetDateIso && (resolvedSellerId || o.assignedSellerId)) ? targetDateIso : o.assignedAt,
             assignedSellerId: resolvedSellerId,
             assignedSellerName: resolvedSellerName,
             costDeductedFromSeller: wasCostDeducted,
             costDeductedAmount: deductedAmount,
             pickedAt: isNowPicked ? (o.pickedAt || new Date().toISOString()) : o.pickedAt,
             timeline: updatedTimeline,
-            updatedAt: new Date().toISOString(),
+            updatedAt: targetDateIso || new Date().toISOString(),
           };
 
           // Broadcast live update to Firestore so Admin Panel sees it immediately
@@ -4789,11 +4890,17 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           return updatedOrder;
         }
         return o;
-      })
-    );
+      });
+      safeSave('nexus_orders', next);
+      try {
+        localStorage.setItem('nexus_orders', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
   };
 
   const deleteOrder = (orderId: string) => {
+    recordDeletedOrderId(orderId);
     setOrders((prev) => {
       const next = prev.filter((o) => o.id !== orderId);
       try {
@@ -4805,9 +4912,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     try {
       if (typeof BroadcastChannel !== 'undefined') {
-        const bc = new BroadcastChannel('nexus_wallet_channel');
+        const bc = new BroadcastChannel('nexus_order_channel');
         bc.postMessage({ type: 'ORDER_DELETED', orderId });
-        bc.close();
+        setTimeout(() => bc.close(), 1000);
       }
     } catch {}
 

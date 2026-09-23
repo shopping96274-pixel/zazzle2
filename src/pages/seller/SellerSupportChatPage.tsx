@@ -107,25 +107,35 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
         }
       } catch {}
       return null;
-    })() ||
-    sellers.find((s) => !s.id.includes('dummy') && !s.id.includes('default')) ||
-    sellers[0] || {
-      id: currentUser.id ? `seller_${currentUser.id}` : 'seller_unregistered',
-      userId: currentUser.id,
-      shopName: currentUser.name ? `${currentUser.name}'s Shop` : 'Store',
-      sellerName: currentUser.name || 'Seller',
-      email: currentUser.email || 'seller@store.com',
-      phone: currentUser.phone || '',
-      address: '',
-      city: '',
-      country: '',
-      withdrawalMethod: 'BANK_TRANSFER' as const,
-      payoutDetails: 'Bank Transfer',
-      applicationStatus: 'PENDING' as const,
-      joinedDate: new Date().toISOString(),
-      rating: 5.0,
-      totalSalesVolume: 0,
-    };
+    })() || null;
+
+  useEffect(() => {
+    if (!currentSeller) {
+      if (onNavigate) {
+        onNavigate('seller-login');
+      }
+    }
+  }, [currentSeller, onNavigate]);
+
+  if (!currentSeller) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4">
+        <div className="bg-slate-900 border border-slate-800 p-8 rounded-2xl max-w-md w-full text-center space-y-4 shadow-xl">
+          <h2 className="text-base font-bold text-white">Merchant Authentication Required</h2>
+          <p className="text-xs text-slate-400">
+            Please log in with your seller account to access customer care support.
+          </p>
+          <button
+            type="button"
+            onClick={() => onNavigate && onNavigate('seller-login')}
+            className="w-full py-2.5 bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold rounded-xl text-xs transition-colors cursor-pointer"
+          >
+            Go to Seller Login
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   const isFrozen = Boolean(
     currentUser.role !== 'ADMIN' &&
