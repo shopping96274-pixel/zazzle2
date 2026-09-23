@@ -314,6 +314,7 @@ interface StoreContextType {
   deleteSingleMessage: (messageId: string, convId?: string, extraCandidateIds?: string[]) => void;
   deleteConversationAndReset: (conversationId: string, extraCandidateIds?: string[]) => void;
   deleteEntireConversation: (conversationId: string) => void;
+  syncMessagesWithFirestore: (conversationId: string, validMessages: Message[], candidateIds?: string[]) => void;
   sendChatMessage: typeof sendChatMessage;
   listenToChatMessages: typeof listenToChatMessages;
 
@@ -6518,6 +6519,50 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     } catch {}
   };
 
+  const syncMessagesWithFirestore = (
+    conversationId: string,
+    validMessages: Message[],
+    candidateIds?: string[]
+  ) => {
+    const rawIds = [conversationId, ...(candidateIds || [])].map((id) => (id || '').trim()).filter(Boolean);
+    const idSet = new Set<string>();
+    rawIds.forEach((id) => {
+      const clean = id.startsWith('conv_') ? id.replace(/^conv_/, '') : id;
+      idSet.add(id);
+      idSet.add(clean);
+      idSet.add(`conv_${clean}`);
+    });
+
+    const validIdSet = new Set(validMessages.map((m) => m.id));
+    const now = Date.now();
+
+    setMessages((prev) => {
+      let changed = false;
+      const updated = prev.filter((m) => {
+        const belongsToThread =
+          idSet.has(m.conversationId) ||
+          idSet.has(m.senderId) ||
+          ((m as any).receiverId && idSet.has((m as any).receiverId));
+        if (!belongsToThread) return true;
+        // If it's confirmed present in Firestore, keep it
+        if (validIdSet.has(m.id)) return true;
+        // In flight check: If sent within the last 8 seconds, keep it while Firestore syncs
+        const age = now - new Date(m.timestamp).getTime();
+        if (age < 8000) return true;
+        // Otherwise it was deleted in Firestore! Prune it!
+        changed = true;
+        return false;
+      });
+
+      if (changed) {
+        try {
+          localStorage.setItem('nexus_messages', JSON.stringify(updated));
+        } catch {}
+      }
+      return changed ? updated : prev;
+    });
+  };
+
   const deleteEntireConversation = (conversationId: string) => {
     setMessages((prev) =>
       prev.filter(
@@ -6711,6 +6756,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         deleteSingleMessage,
         deleteConversationAndReset,
         deleteEntireConversation,
+        syncMessagesWithFirestore,
         sendChatMessage,
         listenToChatMessages,
         notifications,

@@ -100,6 +100,9 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
     startOrGetSupportConversation,
     markConversationAsRead,
     listenToChatMessages,
+    deleteSingleMessage,
+    deleteConversationAndReset,
+    syncMessagesWithFirestore,
     settings,
     updateSellerStatus,
     updateSellerProfile,
@@ -1173,14 +1176,56 @@ const getFixedCategoryCount = (name: string, id: string): string => {
     (currentUser.id !== 'guest_visitor' ? currentUser.id : currentSeller?.id) ||
     'seller_active';
 
-  // Listen to live messages for this seller from Firestore
+  const sellerCandidateIds = React.useMemo(() => {
+    const ids = new Set<string>([
+      sellerConv.id,
+      sellerConv.id.replace(/^conv_/, ''),
+      `conv_${sellerConv.id.replace(/^conv_/, '')}`,
+      sellerIdentifier,
+      sellerIdentifier.replace(/^conv_/, ''),
+      `conv_${sellerIdentifier.replace(/^conv_/, '')}`,
+    ]);
+    if (currentSeller?.id) {
+      ids.add(currentSeller.id);
+      ids.add(currentSeller.id.replace(/^conv_/, ''));
+      ids.add(`conv_${currentSeller.id.replace(/^conv_/, '')}`);
+    }
+    if (currentSeller?.userId) {
+      ids.add(currentSeller.userId);
+      ids.add(currentSeller.userId.replace(/^conv_/, ''));
+      ids.add(`conv_${currentSeller.userId.replace(/^conv_/, '')}`);
+    }
+    return Array.from(ids).filter(Boolean);
+  }, [sellerConv.id, sellerIdentifier, currentSeller?.id, currentSeller?.userId]);
+
+  const [hasReceivedFloatingFirestore, setHasReceivedFloatingFirestore] = useState(false);
+  const floatingRoomsRef = useRef<Record<string, any[]>>({});
+
+  // Listen to live messages for this seller from Firestore across all candidate rooms
   useEffect(() => {
-    if (!sellerIdentifier || !listenToChatMessages) return;
-    const unsub = listenToChatMessages(sellerIdentifier, (liveMsgs) => {
-      setFloatingRealtimeMsgs(liveMsgs);
+    if (sellerCandidateIds.length === 0 || !listenToChatMessages) return;
+    const unsubs: (() => void)[] = [];
+
+    sellerCandidateIds.forEach((roomId) => {
+      const unsub = listenToChatMessages(roomId, (liveMsgs) => {
+        floatingRoomsRef.current[roomId] = liveMsgs || [];
+        const combined = new Map<string, any>();
+        Object.values(floatingRoomsRef.current).forEach((msgs) => {
+          msgs.forEach((m) => combined.set(m.id, m));
+        });
+        const allLive = Array.from(combined.values());
+        setFloatingRealtimeMsgs(allLive);
+        setHasReceivedFloatingFirestore(true);
+
+        syncMessagesWithFirestore(sellerConv.id, allLive, sellerCandidateIds);
+      });
+      unsubs.push(unsub);
     });
-    return () => unsub();
-  }, [sellerIdentifier, listenToChatMessages]);
+
+    return () => {
+      unsubs.forEach((u) => u());
+    };
+  }, [sellerCandidateIds, listenToChatMessages, sellerConv.id, syncMessagesWithFirestore]);
 
   // Instant broadcast listener for deletions & resets across tabs
   useEffect(() => {
@@ -1188,9 +1233,16 @@ const getFixedCategoryCount = (name: string, id: string): string => {
     const bc = new BroadcastChannel('nexus_chat_channel');
     bc.onmessage = (event) => {
       if (event.data?.type === 'MESSAGE_DELETED' && event.data.messageId) {
-        setFloatingRealtimeMsgs((prev) => prev.filter((m) => m.id !== event.data.messageId));
+        const delId = event.data.messageId;
+        setFloatingRealtimeMsgs((prev) => prev.filter((m) => m.id !== delId));
+        Object.keys(floatingRoomsRef.current).forEach((k) => {
+          floatingRoomsRef.current[k] = (floatingRoomsRef.current[k] || []).filter((m) => m.id !== delId);
+        });
+        syncMessagesWithFirestore(sellerConv.id, [], [delId]);
       } else if (event.data?.type === 'CONVERSATION_RESET') {
         setFloatingRealtimeMsgs([]);
+        floatingRoomsRef.current = {};
+        syncMessagesWithFirestore(sellerConv.id, [], sellerCandidateIds);
       }
     };
     return () => {
@@ -1198,39 +1250,55 @@ const getFixedCategoryCount = (name: string, id: string): string => {
         bc.close();
       } catch {}
     };
-  }, []);
+  }, [sellerConv.id, sellerCandidateIds, syncMessagesWithFirestore]);
 
   const mergedFloatingChatMessages = React.useMemo(() => {
-    const map = new Map<string, any>();
-    const sellerIds = new Set<string>([
-      sellerConv.id,
-      sellerIdentifier,
-      sellerIdentifier.replace(/^conv_/, ''),
-      `conv_${sellerIdentifier.replace(/^conv_/, '')}`,
-    ]);
-    if (currentSeller?.id) {
-      sellerIds.add(currentSeller.id);
-      sellerIds.add(`conv_${currentSeller.id}`);
-    }
-    if (currentSeller?.userId) {
-      sellerIds.add(currentSeller.userId);
-      sellerIds.add(`conv_${currentSeller.userId}`);
+    if (hasReceivedFloatingFirestore) {
+      const map = new Map<string, any>();
+      // Real-time Firestore snapshot is ground truth
+      floatingRealtimeMsgs.forEach((m) => map.set(m.id, m));
+
+      // In flight check (sent in last 8s by seller)
+      const now = Date.now();
+      messages
+        .filter((m) => {
+          if (map.has(m.id)) return false;
+          const isOurThread =
+            sellerCandidateIds.includes(m.conversationId) ||
+            m.senderId === sellerIdentifier ||
+            (currentSeller?.id && m.senderId === currentSeller.id);
+          if (!isOurThread) return false;
+          const msgAge = now - new Date(m.timestamp).getTime();
+          return msgAge < 8000 && m.senderRole === 'SELLER';
+        })
+        .forEach((m) => map.set(m.id, m));
+
+      return Array.from(map.values()).sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
     }
 
+    const map = new Map<string, any>();
     messages
       .filter(
         (m) =>
-          sellerIds.has(m.conversationId) ||
-          sellerIds.has(m.senderId) ||
-          ((m as any).receiverId && sellerIds.has((m as any).receiverId)) ||
-          ((m as any).recipientId && sellerIds.has((m as any).recipientId))
+          sellerCandidateIds.includes(m.conversationId) ||
+          sellerCandidateIds.includes(m.senderId) ||
+          ((m as any).receiverId && sellerCandidateIds.includes((m as any).receiverId)) ||
+          ((m as any).recipientId && sellerCandidateIds.includes((m as any).recipientId))
       )
       .forEach((m) => map.set(m.id, m));
-    floatingRealtimeMsgs.forEach((m) => map.set(m.id, m));
     return Array.from(map.values()).sort(
       (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
     );
-  }, [messages, sellerConv.id, sellerIdentifier, currentSeller?.id, currentSeller?.userId, floatingRealtimeMsgs]);
+  }, [
+    messages,
+    sellerCandidateIds,
+    floatingRealtimeMsgs,
+    hasReceivedFloatingFirestore,
+    sellerIdentifier,
+    currentSeller?.id,
+  ]);
 
   useEffect(() => {
     if (isFloatingChatOpen) {

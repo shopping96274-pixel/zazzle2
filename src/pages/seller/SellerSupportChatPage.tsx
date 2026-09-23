@@ -14,6 +14,7 @@ import {
   ShieldCheck,
   Paperclip,
   Store,
+  Trash2,
 } from 'lucide-react';
 
 interface SellerSupportChatPageProps {
@@ -31,6 +32,9 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
     updateSellerStatus,
     listenToChatMessages,
     logoutSeller,
+    deleteSingleMessage,
+    deleteConversationAndReset,
+    syncMessagesWithFirestore,
   } = useStore();
 
   const [inputText, setInputText] = useState('');
@@ -167,14 +171,62 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
     'SELLER'
   );
 
-  // Real-time Firestore subcollection listener for this seller's chat thread
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+  const [hasReceivedFirestore, setHasReceivedFirestore] = useState(false);
+  const roomMessagesRef = useRef<Record<string, any[]>>({});
+
+  // Compute all possible candidate IDs for this seller thread
+  const sellerRoomIds = React.useMemo(() => {
+    const ids = new Set<string>();
+    if (sellerIdentifier) {
+      ids.add(sellerIdentifier);
+      ids.add(sellerIdentifier.replace(/^conv_/, ''));
+      ids.add(`conv_${sellerIdentifier.replace(/^conv_/, '')}`);
+    }
+    if (currentSeller?.id) {
+      ids.add(currentSeller.id);
+      ids.add(currentSeller.id.replace(/^conv_/, ''));
+      ids.add(`conv_${currentSeller.id.replace(/^conv_/, '')}`);
+    }
+    if (currentSeller?.userId) {
+      ids.add(currentSeller.userId);
+      ids.add(currentSeller.userId.replace(/^conv_/, ''));
+      ids.add(`conv_${currentSeller.userId.replace(/^conv_/, '')}`);
+    }
+    if (activeConv?.id) {
+      ids.add(activeConv.id);
+      ids.add(activeConv.id.replace(/^conv_/, ''));
+      ids.add(`conv_${activeConv.id.replace(/^conv_/, '')}`);
+    }
+    return Array.from(ids).filter(Boolean);
+  }, [sellerIdentifier, currentSeller?.id, currentSeller?.userId, activeConv?.id]);
+
+  // Real-time Firestore subcollection listeners across ALL candidate seller chat threads
   useEffect(() => {
-    if (!sellerIdentifier) return;
-    const unsub = listenToChatMessages(sellerIdentifier, (liveMsgs) => {
-      setRealtimeMessages(liveMsgs);
+    if (sellerRoomIds.length === 0 || !listenToChatMessages) return;
+    const unsubs: (() => void)[] = [];
+
+    sellerRoomIds.forEach((roomId) => {
+      const unsub = listenToChatMessages(roomId, (liveMsgs) => {
+        roomMessagesRef.current[roomId] = liveMsgs || [];
+        const combined = new Map<string, any>();
+        Object.values(roomMessagesRef.current).forEach((msgs) => {
+          msgs.forEach((m) => combined.set(m.id, m));
+        });
+        const allLive = Array.from(combined.values());
+        setRealtimeMessages(allLive);
+        setHasReceivedFirestore(true);
+
+        // Prune deleted messages from StoreContext and localStorage
+        syncMessagesWithFirestore(activeConv.id, allLive, sellerRoomIds);
+      });
+      unsubs.push(unsub);
     });
-    return () => unsub();
-  }, [sellerIdentifier, listenToChatMessages]);
+
+    return () => {
+      unsubs.forEach((u) => u());
+    };
+  }, [sellerRoomIds, listenToChatMessages, activeConv.id, syncMessagesWithFirestore]);
 
   // Instant broadcast listener for deletions & resets across tabs
   useEffect(() => {
@@ -182,9 +234,17 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
     const bc = new BroadcastChannel('nexus_chat_channel');
     bc.onmessage = (event) => {
       if (event.data?.type === 'MESSAGE_DELETED' && event.data.messageId) {
-        setRealtimeMessages((prev) => prev.filter((m) => m.id !== event.data.messageId));
+        const delId = event.data.messageId;
+        setRealtimeMessages((prev) => prev.filter((m) => m.id !== delId));
+        Object.keys(roomMessagesRef.current).forEach((k) => {
+          roomMessagesRef.current[k] = (roomMessagesRef.current[k] || []).filter((m) => m.id !== delId);
+        });
+        // Also sync local StoreContext
+        syncMessagesWithFirestore(activeConv.id, [], [delId]);
       } else if (event.data?.type === 'CONVERSATION_RESET') {
         setRealtimeMessages([]);
+        roomMessagesRef.current = {};
+        syncMessagesWithFirestore(activeConv.id, [], sellerRoomIds);
       }
     };
     return () => {
@@ -192,24 +252,72 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
         bc.close();
       } catch {}
     };
-  }, []);
+  }, [activeConv.id, sellerRoomIds, syncMessagesWithFirestore]);
 
-  // Filter & merge messages for this conversation
+  // Filter & merge messages for this conversation - Firestore snapshot is ground truth
   const conversationMessages = React.useMemo(() => {
+    if (hasReceivedFirestore) {
+      const map = new Map<string, any>();
+      // Real-time Firestore snapshot is the true authoritative state
+      realtimeMessages.forEach((m) => map.set(m.id, m));
+
+      // Only allow local messages that were sent within the last 8 seconds in flight
+      const now = Date.now();
+      messages
+        .filter((m) => {
+          if (map.has(m.id)) return false;
+          const isOurThread =
+            sellerRoomIds.includes(m.conversationId) ||
+            m.senderId === sellerIdentifier ||
+            (currentSeller?.id && m.senderId === currentSeller.id);
+          if (!isOurThread) return false;
+          const msgAge = now - new Date(m.timestamp).getTime();
+          // If message is older than 8s and not in Firestore, it was deleted in Firestore!
+          return msgAge < 8000 && m.senderRole === 'SELLER';
+        })
+        .forEach((m) => map.set(m.id, m));
+
+      return Array.from(map.values()).sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      );
+    }
+
+    // Initial brief loading fallback before Firestore responds
     const map = new Map<string, any>();
     messages
-      .filter(
-        (m) =>
-          m.conversationId === activeConv.id ||
-          m.conversationId === sellerIdentifier ||
-          (currentSeller?.id && m.conversationId === currentSeller.id)
-      )
+      .filter((m) => sellerRoomIds.includes(m.conversationId) || m.conversationId === activeConv.id)
       .forEach((m) => map.set(m.id, m));
-    realtimeMessages.forEach((m) => map.set(m.id, m));
     return Array.from(map.values()).sort(
       (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
     );
-  }, [messages, activeConv.id, sellerIdentifier, currentSeller?.id, realtimeMessages]);
+  }, [
+    messages,
+    activeConv.id,
+    sellerRoomIds,
+    realtimeMessages,
+    hasReceivedFirestore,
+    sellerIdentifier,
+    currentSeller?.id,
+  ]);
+
+  const handleDeleteMessage = (msgId: string) => {
+    // 1. Immediately drop from local state
+    setRealtimeMessages((prev) => prev.filter((m) => m.id !== msgId));
+    Object.keys(roomMessagesRef.current).forEach((k) => {
+      roomMessagesRef.current[k] = (roomMessagesRef.current[k] || []).filter((m) => m.id !== msgId);
+    });
+    // 2. Call StoreContext deleteSingleMessage with all candidate IDs
+    deleteSingleMessage(msgId, activeConv.id, sellerRoomIds);
+  };
+
+  const handleClearHistory = () => {
+    // 1. Immediately blank local states
+    setRealtimeMessages([]);
+    roomMessagesRef.current = {};
+    setShowClearConfirm(false);
+    // 2. Call StoreContext deleteConversationAndReset with all candidate IDs
+    deleteConversationAndReset(activeConv.id, sellerRoomIds);
+  };
 
   // Auto-scroll on new messages
   useEffect(() => {
@@ -366,6 +474,17 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
               <RotateCw className={`w-4 h-4 stroke-[2.2] ${isRefreshing ? 'animate-spin text-amber-400' : ''}`} />
             </button>
 
+            {conversationMessages.length > 0 && (
+              <button
+                onClick={() => setShowClearConfirm(true)}
+                aria-label="Clear Chat History"
+                title="Clear Chat History"
+                className="p-2 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-xl transition-colors cursor-pointer border border-transparent hover:border-slate-700"
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            )}
+
             <button
               onClick={() => {
                 logoutSeller('Logged out');
@@ -483,7 +602,7 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
             return (
               <div
                 key={msg.id || index}
-                className={`flex ${isCustomerCare ? 'justify-start' : 'justify-end'} mb-2`}
+                className={`flex ${isCustomerCare ? 'justify-start' : 'justify-end'} mb-2 group relative`}
               >
                 {/* Incoming Support Card */}
                 {isCustomerCare ? (
@@ -491,7 +610,7 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
                     <div className="w-8 h-8 rounded-xl bg-slate-900 text-amber-400 flex items-center justify-center font-bold text-xs shrink-0 border border-slate-800 shadow-2xs mt-0.5">
                       <Headphones className="w-4 h-4" />
                     </div>
-                    <div className="rounded-2xl rounded-tl-xs bg-white text-slate-900 px-4 py-3 shadow-xs border border-slate-200/90 relative">
+                    <div className="rounded-2xl rounded-tl-xs bg-white text-slate-900 px-4 py-3 shadow-xs border border-slate-200/90 relative group/bubble">
                       {/* Attached Media Photo */}
                       {msg.imageUrl && (
                         <div className="mb-2 rounded-xl overflow-hidden max-w-[280px] bg-slate-100 border border-slate-200">
@@ -509,11 +628,21 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
                           {msg.text}
                         </p>
                       )}
+
+                      {/* Delete icon on hover */}
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteMessage(msg.id)}
+                        title="Delete message"
+                        className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity absolute -top-2 -right-2 bg-white text-slate-400 hover:text-rose-600 p-1 rounded-full shadow-md border border-slate-200 cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
                     </div>
                   </div>
                 ) : (
                   /* Outgoing Seller Message (Self) */
-                  <div className="max-w-[88%] sm:max-w-[78%] rounded-2xl rounded-tr-xs bg-slate-900 text-slate-50 px-4 py-3 shadow-sm border border-slate-800 relative">
+                  <div className="max-w-[88%] sm:max-w-[78%] rounded-2xl rounded-tr-xs bg-slate-900 text-slate-50 px-4 py-3 shadow-sm border border-slate-800 relative group/bubble">
                     {/* Attached Media Photo */}
                     {msg.imageUrl && (
                       <div className="mb-2 rounded-xl overflow-hidden max-w-[280px] bg-slate-950 border border-slate-700">
@@ -531,6 +660,16 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
                         {msg.text}
                       </p>
                     )}
+
+                    {/* Delete icon on hover */}
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteMessage(msg.id)}
+                      title="Delete message"
+                      className="opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity absolute -top-2 -left-2 bg-slate-800 text-slate-400 hover:text-rose-400 p-1 rounded-full shadow-md border border-slate-700 cursor-pointer"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 )}
               </div>
@@ -644,6 +783,39 @@ export const SellerSupportChatPage: React.FC<SellerSupportChatPageProps> = ({ on
             </button>
           </div>
         </div>
+
+        {/* Clear Chat History Confirmation Modal */}
+        {showClearConfirm && (
+          <div className="fixed inset-0 z-50 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl p-5 max-w-sm w-full shadow-2xl border border-slate-200 animate-in fade-in zoom-in-95">
+              <div className="flex items-center gap-3 text-rose-600 mb-3">
+                <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-100">
+                  <Trash2 className="w-5 h-5" />
+                </div>
+                <h3 className="font-bold text-slate-900 text-base">Clear Chat History?</h3>
+              </div>
+              <p className="text-xs text-slate-600 mb-5 leading-relaxed">
+                This will permanently delete all messages in this conversation for both you and Customer Care.
+              </p>
+              <div className="flex gap-2 justify-end">
+                <button
+                  type="button"
+                  onClick={() => setShowClearConfirm(false)}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleClearHistory}
+                  className="px-4 py-2 rounded-xl text-xs font-semibold text-white bg-rose-600 hover:bg-rose-700 transition-colors shadow-xs cursor-pointer"
+                >
+                  Yes, Clear History
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
       </div>
     </div>
