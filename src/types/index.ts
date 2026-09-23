@@ -328,6 +328,7 @@ export interface Conversation {
   participantTwoRole: UserRole;
   lastMessageText: string;
   lastMessageTime: string;
+  lastSenderRole?: UserRole;
   unreadCountParticipantOne: number;
   unreadCountParticipantTwo: number;
 }

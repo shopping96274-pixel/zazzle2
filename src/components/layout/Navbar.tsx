@@ -148,10 +148,12 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   const userDropdownRef = useRef<HTMLDivElement>(null);
   const notifDropdownRef = useRef<HTMLDivElement>(null);
+  const mobileMenuRef = useRef<HTMLDivElement>(null);
+  const mobileMenuBtnRef = useRef<HTMLButtonElement>(null);
 
-  // Close dropdowns when clicking anywhere outside
+  // Close dropdowns and mobile menu when clicking or touching anywhere outside
   useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
+    const handleClickOutside = (event: MouseEvent | TouchEvent) => {
       const target = event.target as Node;
       if (userDropdownRef.current && !userDropdownRef.current.contains(target)) {
         setUserDropdownOpen(false);
@@ -159,11 +161,21 @@ export const Navbar: React.FC<NavbarProps> = ({
       if (notifDropdownRef.current && !notifDropdownRef.current.contains(target)) {
         setNotifDropdownOpen(false);
       }
+      if (
+        mobileMenuRef.current &&
+        !mobileMenuRef.current.contains(target) &&
+        mobileMenuBtnRef.current &&
+        !mobileMenuBtnRef.current.contains(target)
+      ) {
+        setMobileMenuOpen(false);
+      }
     };
 
     document.addEventListener('mousedown', handleClickOutside);
+    document.addEventListener('touchstart', handleClickOutside, { passive: true });
     return () => {
       document.removeEventListener('mousedown', handleClickOutside);
+      document.removeEventListener('touchstart', handleClickOutside);
     };
   }, []);
 
@@ -507,9 +519,11 @@ export const Navbar: React.FC<NavbarProps> = ({
 
             {/* Mobile Menu Toggle Button */}
             <button
+              ref={mobileMenuBtnRef}
               id="mobile-menu-toggle-btn"
               onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
-              className="md:hidden p-1.5 text-slate-300 hover:text-white rounded-lg"
+              className="md:hidden p-1.5 text-slate-300 hover:text-white rounded-lg focus:outline-none"
+              aria-label={mobileMenuOpen ? 'Close menu' : 'Open menu'}
             >
               {mobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
             </button>
@@ -574,9 +588,22 @@ export const Navbar: React.FC<NavbarProps> = ({
         </div>
       </div>
 
+      {/* Screen Backdrop for Mobile Menu - tapping anywhere on the screen closes the menu */}
+      {mobileMenuOpen && (
+        <div
+          className="fixed inset-0 top-0 z-20 bg-black/60 md:hidden backdrop-blur-2xs transition-opacity animate-in fade-in duration-150"
+          onClick={() => setMobileMenuOpen(false)}
+          onTouchStart={() => setMobileMenuOpen(false)}
+          aria-hidden="true"
+        />
+      )}
+
       {/* Mobile Drawer Menu */}
       {mobileMenuOpen && (
-        <div className="md:hidden bg-slate-900 border-b border-slate-800 px-4 pt-3 pb-5 space-y-3">
+        <div
+          ref={mobileMenuRef}
+          className="md:hidden relative z-30 bg-slate-900 border-b border-slate-800 px-4 pt-3 pb-5 space-y-3 shadow-2xl"
+        >
           <form onSubmit={handleSearchSubmit} className="relative w-full">
             <input
               type="text"

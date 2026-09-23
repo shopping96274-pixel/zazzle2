@@ -22,6 +22,11 @@ service cloud.firestore {
       allow read, write: if isValidId(orderId);
     }
 
+    // 3b. Globally Tracked Deleted Orders (Synchronizes admin order deletions to all seller dashboards)
+    match /deleted_orders/{orderId} {
+      allow read, write: if isValidId(orderId);
+    }
+
     // 4. Seller Profiles & Verification
     match /sellers/{sellerId} {
       allow read, write: if isValidId(sellerId);

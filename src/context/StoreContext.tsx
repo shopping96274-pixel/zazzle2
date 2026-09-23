@@ -59,6 +59,8 @@ import {
   fetchAllFirestoreSellers,
   listenToFirestoreWallets,
   listenToFirestoreOrders,
+  fetchFirestoreOrders,
+  listenToFirestoreDeletedOrders,
   saveStoreContactsToFirestore,
   listenToFirestoreStoreContacts,
   updateSellerSubscriptionInFirestore,
@@ -212,6 +214,7 @@ interface StoreContextType {
   deleteProduct: (id: string) => void;
   toggleProductPublish: (id: string) => void;
   toggleSellerProductEligibility: (productId: string, sellerId: string) => void;
+  removeProductFromSeller: (productId: string, sellerId: string) => void;
   addProductsToSeller: (productIds: string[], sellerId: string) => void;
 
   // Sellers & Applications
@@ -251,6 +254,7 @@ interface StoreContextType {
   updateOrderDate: (orderId: string, newDateIsoOrString: string) => void;
   updateOrderStatus: (orderId: string, newStatus: OrderStatus, note?: string, newDateIsoOrString?: string) => void;
   deleteOrder: (orderId: string) => void;
+  refreshOrders: () => Promise<void>;
 
   // Wallets & Financials
   wallets: Record<string, SellerWallet>;
@@ -1034,17 +1038,17 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [orders, setOrders] = useState<Order[]>(() => {
     const saved = localStorage.getItem('nexus_orders');
     if (!saved) {
-      return [...INITIAL_ORDERS].sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      return [...INITIAL_ORDERS].filter((o) => !isOrderDeleted(o.id)).sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
     }
     try {
       const parsed: Order[] = JSON.parse(saved);
       return parsed
         .filter(
-          (o) => !o.assignedSellerId || (!DUMMY_SELLER_IDS.has(o.assignedSellerId) && !o.assignedSellerId.includes('@seller.com'))
+          (o) => !isOrderDeleted(o.id) && (!o.assignedSellerId || (!DUMMY_SELLER_IDS.has(o.assignedSellerId) && !o.assignedSellerId.includes('@seller.com')))
         )
         .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
     } catch {
-      return [...INITIAL_ORDERS].sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      return [...INITIAL_ORDERS].filter((o) => !isOrderDeleted(o.id)).sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
     }
   });
 
@@ -1341,17 +1345,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             setConversations((prev) =>
               prev.map((c) => {
                 if (c.id === incoming.conversationId) {
-                  const isSenderPartOne = c.participantOneId === incoming.senderId;
+                  const isIncomingFromAdmin = incoming.senderRole === 'ADMIN';
                   return {
                     ...c,
                     lastMessageText: incoming.text || (incoming.imageUrl ? '📷 Photo' : 'Message'),
                     lastMessageTime: incoming.timestamp,
-                    unreadCountParticipantOne: isSenderPartOne
-                      ? c.unreadCountParticipantOne
-                      : c.unreadCountParticipantOne + 1,
-                    unreadCountParticipantTwo: !isSenderPartOne
-                      ? c.unreadCountParticipantTwo
-                      : c.unreadCountParticipantTwo + 1,
+                    lastSenderRole: incoming.senderRole,
+                    unreadCountParticipantOne: isIncomingFromAdmin
+                      ? (c.unreadCountParticipantOne || 0) + 1
+                      : (c.unreadCountParticipantOne || 0),
+                    unreadCountParticipantTwo: isIncomingFromAdmin
+                      ? 0
+                      : (c.unreadCountParticipantTwo || 0) + 1,
                   };
                 }
                 return c;
@@ -1420,16 +1425,21 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         setConversations((prev) => {
           const idx = prev.findIndex((c) => c.id === incoming.conversationId);
           const msgText = incoming.text || (incoming.imageUrl ? '[Image]' : '');
+          const isIncomingFromAdmin = incoming.senderRole === 'ADMIN';
           if (idx !== -1) {
             const updated = [...prev];
             const c = updated[idx];
-            const isSenderPartOne = c.participantOneId === incoming.senderId;
             updated[idx] = {
               ...c,
               lastMessageText: msgText,
               lastMessageTime: incoming.timestamp,
-              unreadCountParticipantOne: isSenderPartOne ? c.unreadCountParticipantOne : c.unreadCountParticipantOne + 1,
-              unreadCountParticipantTwo: !isSenderPartOne ? c.unreadCountParticipantTwo : c.unreadCountParticipantTwo + 1,
+              lastSenderRole: incoming.senderRole,
+              unreadCountParticipantOne: isIncomingFromAdmin
+                ? (c.unreadCountParticipantOne || 0) + 1
+                : (c.unreadCountParticipantOne || 0),
+              unreadCountParticipantTwo: isIncomingFromAdmin
+                ? 0
+                : (c.unreadCountParticipantTwo || 0) + 1,
             };
             return updated;
           } else {
@@ -1445,8 +1455,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
               participantTwoRole: 'ADMIN',
               lastMessageText: msgText,
               lastMessageTime: incoming.timestamp,
-              unreadCountParticipantOne: 0,
-              unreadCountParticipantTwo: incoming.senderRole !== 'ADMIN' ? 1 : 0,
+              lastSenderRole: incoming.senderRole,
+              unreadCountParticipantOne: isIncomingFromAdmin ? 1 : 0,
+              unreadCountParticipantTwo: isIncomingFromAdmin ? 0 : 1,
             };
             return [newConv, ...prev];
           }
@@ -1478,6 +1489,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
             const sellerMatch = sellers.find(
               (s) => s.id === chat.sellerId || s.userId === chat.sellerId
             );
+            const lastSenderRole = chat.lastSenderRole || (chat.lastMessageRole ? String(chat.lastMessageRole).toUpperCase() : undefined);
+            const isLastFromAdmin = lastSenderRole === 'ADMIN';
             const conv: Conversation = {
               id: chat.id,
               type: 'SELLER_ADMIN',
@@ -1489,8 +1502,9 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
               participantTwoRole: 'ADMIN',
               lastMessageText: chat.lastMessage || chat.lastMessageText || 'Chat thread opened',
               lastMessageTime: chat.lastMessageTime || new Date().toISOString(),
-              unreadCountParticipantOne: 0,
-              unreadCountParticipantTwo: chat.lastMessage ? 1 : 0,
+              lastSenderRole: lastSenderRole,
+              unreadCountParticipantOne: chat.unreadCountParticipantOne ?? chat.unreadSeller ?? (isLastFromAdmin ? 1 : 0),
+              unreadCountParticipantTwo: isLastFromAdmin ? 0 : (chat.unreadCountParticipantTwo ?? chat.unreadAdmin ?? 0),
             };
             map.set(chat.id, conv);
           });
@@ -1551,7 +1565,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       if (e.key === 'nexus_orders' && e.newValue) {
         try {
           const parsed: Order[] = JSON.parse(e.newValue);
-          setOrders(parsed);
+          if (Array.isArray(parsed)) {
+            setOrders(parsed.filter((o) => !isOrderDeleted(o.id)));
+          }
+        } catch {}
+      }
+      if (e.key === 'nexus_deleted_order_ids' && e.newValue) {
+        try {
+          const ids: string[] = JSON.parse(e.newValue);
+          if (Array.isArray(ids)) {
+            ids.forEach((id) => recordDeletedOrderId(id));
+            setOrders((prev) => prev.filter((o) => !ids.includes(o.id)));
+          }
         } catch {}
       }
       if (e.key === 'nexus_withdrawals' && e.newValue) {
@@ -1812,6 +1837,42 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
                 selectedProductIds: (s.selectedProductIds || []).filter((id) => id !== payload.productId),
               }))
             );
+          } else if (action === 'PRODUCT_REMOVED_FROM_SELLER' && payload) {
+            const { productId, sellerId } = payload;
+            const targetIds = new Set<string>();
+            if (sellerId) targetIds.add(String(sellerId).toLowerCase());
+
+            setProducts((prev) =>
+              prev.map((p) => {
+                if (p.id === productId) {
+                  const currentAssociated = p.associatedSellerIds || [];
+                  const updatedAssociated = currentAssociated.filter((id) => !targetIds.has(id.toLowerCase()));
+                  const pSellerIdLower = (p.sellerId || '').toLowerCase();
+                  const isMySellerId = Boolean(pSellerIdLower && targetIds.has(pSellerIdLower));
+                  return {
+                    ...p,
+                    associatedSellerIds: updatedAssociated,
+                    ...(isMySellerId ? { sellerId: undefined } : {}),
+                  };
+                }
+                return p;
+              })
+            );
+
+            setSellers((prev) =>
+              prev.map((s) => {
+                const sIdLower = (s.id || '').toLowerCase();
+                const uIdLower = (s.userId || '').toLowerCase();
+                const emLower = (s.email || '').toLowerCase();
+                if (targetIds.has(sIdLower) || (uIdLower && targetIds.has(uIdLower)) || (emLower && targetIds.has(emLower))) {
+                  return {
+                    ...s,
+                    selectedProductIds: (s.selectedProductIds || []).filter((id) => id !== productId),
+                  };
+                }
+                return s;
+              })
+            );
           } else if (action === 'INVALIDATE_PRODUCTS') {
             fetchCachedFirestoreProducts(true).then((freshProds) => {
               if (freshProds && freshProds.length > 0) {
@@ -1825,7 +1886,15 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         orderSyncChannel.onmessage = (event) => {
           const { type, orderId } = event.data || {};
           if (type === 'ORDER_DELETED' && orderId) {
-            setOrders((prev) => prev.filter((o) => o.id !== orderId));
+            recordDeletedOrderId(orderId);
+            setOrders((prev) => {
+              const next = prev.filter((o) => o.id !== orderId);
+              safeSave('nexus_orders', next);
+              try {
+                localStorage.setItem('nexus_orders', JSON.stringify(next));
+              } catch {}
+              return next;
+            });
           }
         };
       }
@@ -2004,14 +2073,46 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     const unsubOrders = listenToFirestoreOrders((liveOrders) => {
       if (Array.isArray(liveOrders)) {
         setOrders((prev) => {
-          const filtered = liveOrders.filter((lo: any) => lo && lo.id && !isOrderDeleted(lo.id));
-          const liveIds = new Set(filtered.map((o) => o.id));
-          const localOnly = prev.filter((p) => !liveIds.has(p.id) && !isOrderDeleted(p.id));
-          const merged = [...filtered, ...localOnly].sort(
+          const activeLive = liveOrders.filter((lo: any) => lo && lo.id && !isOrderDeleted(lo.id));
+          const liveIds = new Set(activeLive.map((o) => o.id));
+
+          // Only keep local orders if they are pending checkout sync (< 60s) AND NOT assigned orders
+          // (Assigned orders are strictly managed by Admin via Firestore. If Admin deletes it, it MUST NOT be resurrected by seller's browser)
+          const now = Date.now();
+          const pendingLocalOnly = prev.filter((p) => {
+            if (liveIds.has(p.id) || isOrderDeleted(p.id)) return false;
+            // Never keep assigned orders that are missing from Firestore
+            if (p.assignedSellerId || p.assignedSellerName) return false;
+            // Only keep un-synced local customer checkout orders placed within the last 60 seconds
+            const orderAge = p.createdAt ? now - new Date(p.createdAt).getTime() : Infinity;
+            return orderAge < 60000;
+          });
+
+          const merged = [...activeLive, ...pendingLocalOnly].sort(
             (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
           );
           safeSave('nexus_orders', merged);
+          try {
+            localStorage.setItem('nexus_orders', JSON.stringify(merged));
+          } catch {}
           return merged;
+        });
+      }
+    });
+
+    // 6b. Real-time Firestore sync for globally tracked deleted orders
+    const unsubDeletedOrders = listenToFirestoreDeletedOrders((deletedIds) => {
+      if (Array.isArray(deletedIds) && deletedIds.length > 0) {
+        const delSet = new Set(deletedIds);
+        setOrders((prev) => {
+          const hasAny = prev.some((o) => delSet.has(o.id));
+          if (!hasAny) return prev;
+          const next = prev.filter((o) => !delSet.has(o.id));
+          safeSave('nexus_orders', next);
+          try {
+            localStorage.setItem('nexus_orders', JSON.stringify(next));
+          } catch {}
+          return next;
         });
       }
     });
@@ -2135,6 +2236,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       unsubSellers();
       unsubWallets();
       unsubOrders();
+      unsubDeletedOrders();
       unsubContacts();
       unsubSubscriptionPlan();
       unsubInvitationCode();
@@ -3996,6 +4098,100 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     );
   };
 
+  const removeProductFromSeller = (productId: string, sellerId: string) => {
+    if (!productId || !sellerId) return;
+
+    const matchingSeller = sellers.find(
+      (s) =>
+        s.id === sellerId ||
+        s.userId === sellerId ||
+        (s.email && s.email.toLowerCase() === sellerId.toLowerCase()) ||
+        (sellerId.length > 2 &&
+          ((s.shopName && s.shopName.toLowerCase().includes(sellerId.toLowerCase())) ||
+            (s.sellerName && s.sellerName.toLowerCase().includes(sellerId.toLowerCase()))))
+    );
+
+    const targetSellerIds = new Set<string>();
+    if (sellerId) targetSellerIds.add(sellerId.toLowerCase());
+    if (matchingSeller) {
+      if (matchingSeller.id) targetSellerIds.add(matchingSeller.id.toLowerCase());
+      if (matchingSeller.userId) targetSellerIds.add(matchingSeller.userId.toLowerCase());
+      if (matchingSeller.email) targetSellerIds.add(matchingSeller.email.toLowerCase());
+    }
+
+    // 1. Update Product in state, localStorage & Firestore
+    setProducts((prev) => {
+      const next = prev.map((p) => {
+        if (p.id === productId) {
+          const currentList = p.associatedSellerIds || [];
+          const updatedSellers = currentList.filter((sId) => !targetSellerIds.has(sId.toLowerCase()));
+          const pSellerIdLower = (p.sellerId || '').toLowerCase();
+          const isMySellerId = Boolean(pSellerIdLower && targetSellerIds.has(pSellerIdLower));
+
+          const updatedProd: Product = {
+            ...p,
+            associatedSellerIds: updatedSellers,
+            ...(isMySellerId ? { sellerId: undefined } : {}),
+            updatedAt: new Date().toISOString(),
+          };
+          saveProductToFirestore(updatedProd);
+          return updatedProd;
+        }
+        return p;
+      });
+      safeSave('nexus_products', next);
+      try {
+        localStorage.setItem('nexus_products', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+
+    // 2. Update Seller profile in state, localStorage & Firestore
+    if (matchingSeller) {
+      setSellers((prev) => {
+        const next = prev.map((s) => {
+          const sIdLower = (s.id || '').toLowerCase();
+          const uIdLower = (s.userId || '').toLowerCase();
+          const isTarget = targetSellerIds.has(sIdLower) || (uIdLower && targetSellerIds.has(uIdLower));
+          if (isTarget) {
+            const currentSelected = s.selectedProductIds || [];
+            const updatedSelected = currentSelected.filter((id) => id !== productId);
+            const updatedSeller: SellerProfile = {
+              ...s,
+              selectedProductIds: updatedSelected,
+              productsCount: Math.max(0, updatedSelected.length),
+            };
+            saveSellerKycToFirestore({
+              ...updatedSeller,
+              sellerId: updatedSeller.id,
+            }).catch((err) =>
+              console.warn('[Firestore] Sync seller removed product error:', err)
+            );
+            return updatedSeller;
+          }
+          return s;
+        });
+        safeSave('nexus_sellers', stripImagesForStorage(next));
+        try {
+          localStorage.setItem('nexus_sellers', JSON.stringify(stripImagesForStorage(next)));
+        } catch {}
+        return next;
+      });
+    }
+
+    // 3. Cross-tab BroadcastChannel
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        const bc = new BroadcastChannel('nexus_catalog_sync');
+        bc.postMessage({
+          action: 'PRODUCT_REMOVED_FROM_SELLER',
+          payload: { productId, sellerId: matchingSeller?.id || sellerId },
+        });
+        setTimeout(() => bc.close(), 1000);
+      }
+    } catch {}
+  };
+
   // Cart
   const addToCart = (product: Product, quantity = 1) => {
     setCart((prev) => {
@@ -4921,6 +5117,35 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     deleteOrderFromFirestore(orderId).catch((err) => {
       console.warn('[Firestore] Error deleting order from Firestore backend:', err);
     });
+  };
+
+  const refreshOrders = async () => {
+    try {
+      const freshOrders = await fetchFirestoreOrders();
+      if (Array.isArray(freshOrders)) {
+        setOrders((prev) => {
+          const activeLive = freshOrders.filter((lo: any) => lo && lo.id && !isOrderDeleted(lo.id));
+          const liveIds = new Set(activeLive.map((o) => o.id));
+          const now = Date.now();
+          const pendingLocalOnly = prev.filter((p) => {
+            if (liveIds.has(p.id) || isOrderDeleted(p.id)) return false;
+            if (p.assignedSellerId || p.assignedSellerName) return false;
+            const orderAge = p.createdAt ? now - new Date(p.createdAt).getTime() : Infinity;
+            return orderAge < 60000;
+          });
+          const merged = [...activeLive, ...pendingLocalOnly].sort(
+            (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+          );
+          safeSave('nexus_orders', merged);
+          try {
+            localStorage.setItem('nexus_orders', JSON.stringify(merged));
+          } catch {}
+          return merged;
+        });
+      }
+    } catch (err) {
+      console.warn('[StoreContext] refreshOrders notice:', err);
+    }
   };
 
   // Withdrawals
@@ -5920,17 +6145,18 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setConversations((prev) =>
       prev.map((c) => {
         if (c.id === conversationId) {
-          const isSenderPartOne = c.participantOneId === senderId;
+          const isSenderAdmin = senderRole === 'ADMIN';
           return {
             ...c,
             lastMessageText: text || (imageUrl ? '📷 Photo' : 'Message'),
             lastMessageTime: new Date().toISOString(),
-            unreadCountParticipantOne: isSenderPartOne
-              ? c.unreadCountParticipantOne
-              : c.unreadCountParticipantOne + 1,
-            unreadCountParticipantTwo: !isSenderPartOne
-              ? c.unreadCountParticipantTwo
-              : c.unreadCountParticipantTwo + 1,
+            lastSenderRole: senderRole,
+            unreadCountParticipantOne: isSenderAdmin
+              ? (c.unreadCountParticipantOne || 0) + 1
+              : (c.unreadCountParticipantOne || 0),
+            unreadCountParticipantTwo: isSenderAdmin
+              ? 0
+              : (c.unreadCountParticipantTwo || 0) + 1,
           };
         }
         return c;
@@ -6339,6 +6565,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         deleteProduct,
         toggleProductPublish,
         toggleSellerProductEligibility,
+        removeProductFromSeller,
         addProductsToSeller,
         sellers,
         approveSellerApplication,
@@ -6365,6 +6592,7 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         updateOrderDate,
         updateOrderStatus,
         deleteOrder,
+        refreshOrders,
         wallets,
         transactions,
         withdrawals,

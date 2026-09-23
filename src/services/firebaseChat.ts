@@ -82,6 +82,8 @@ export async function sendChatMessage(
         lastMessageText: summaryText,
         updatedAt: serverTimestamp(),
         lastMessageTime: new Date().toISOString(),
+        lastSenderRole: isSeller ? 'SELLER' : 'ADMIN',
+        lastSenderId: senderId,
         sellerId: chatId,
         participantOneId: chatId,
         participantOneName: extra?.senderName || (isSeller ? 'Seller' : undefined),
@@ -89,6 +91,11 @@ export async function sendChatMessage(
         participantTwoId: 'user_admin',
         participantTwoName: 'Customer Care & Admin',
         participantTwoRole: 'ADMIN',
+        // Admin msg bhejey to Admin side par unread 0 hona chahye, notification na banay
+        unreadAdmin: isSeller ? 1 : 0,
+        unreadCountParticipantTwo: isSeller ? 1 : 0,
+        unreadSeller: isSeller ? 0 : 1,
+        unreadCountParticipantOne: isSeller ? 0 : 1,
       },
       { merge: true }
     );

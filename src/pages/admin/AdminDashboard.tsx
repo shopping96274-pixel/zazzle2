@@ -193,6 +193,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
     deleteSellerLoginSessionById,
     refreshAllCloudData,
     toggleSellerProductEligibility,
+    removeProductFromSeller,
   } = useStore();
 
   const [adminLoginEmail, setAdminLoginEmail] = useState('admin');
@@ -841,15 +842,47 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
 
   const getAdminUnreadCount = (conv: any): number => {
     if (!conv) return 0;
+    // 1. If this conversation is currently open in active admin view, it is already being read
+    if (activeTab === 'conversations' && activeConvId === conv.id) {
+      return 0;
+    }
+
+    // 2. Check actual messages in memory for this conversation
+    const convIds: string[] = [conv.id, ...(conv.allConvIds || [])].filter(Boolean);
+    const relatedMessages = messages.filter((m) => convIds.includes(m.conversationId));
+
+    if (relatedMessages.length > 0) {
+      const sorted = [...relatedMessages].sort(
+        (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      );
+      const newestMsg = sorted[0];
+
+      // If the newest message was sent by ADMIN, admin has NO unread notification
+      if (newestMsg.senderRole === 'ADMIN') {
+        return 0;
+      }
+
+      // Count unread messages strictly sent by someone other than ADMIN
+      const unreadFromOthers = relatedMessages.filter((m) => m.senderRole !== 'ADMIN' && !m.isRead);
+      return unreadFromOthers.length;
+    }
+
+    // 3. If last message was sent by ADMIN, unread is 0
+    if (conv.lastSenderRole === 'ADMIN' || conv.lastSenderRole === 'admin') {
+      return 0;
+    }
+
+    // 4. Fallback to recorded unread count
     const isParticipantTwoAdmin = conv.participantTwoRole === 'ADMIN';
-    const recordedUnread = isParticipantTwoAdmin ? conv.unreadCountParticipantTwo : conv.unreadCountParticipantOne;
+    const recordedUnread = isParticipantTwoAdmin
+      ? (conv.unreadCountParticipantTwo ?? conv.unreadAdmin ?? 0)
+      : (conv.unreadCountParticipantOne ?? conv.unreadSeller ?? 0);
+
     if (typeof recordedUnread === 'number' && recordedUnread > 0) {
       return recordedUnread;
     }
-    const unreadMsgs = messages.filter(
-      (m) => m.conversationId === conv.id && m.senderRole !== 'ADMIN' && !m.isRead
-    );
-    return unreadMsgs.length;
+
+    return 0;
   };
 
   const formatAdminMessageDateTime = (isoDateString?: string): string => {
@@ -993,6 +1026,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
       senderName: 'Platform Support Team',
       senderRole: 'ADMIN',
     });
+    markConversationAsRead(activeConvId, 'ADMIN');
     setAdminChatInput('');
     if (adminTextareaRef.current) {
       adminTextareaRef.current.style.height = 'auto';
@@ -1117,6 +1151,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
       senderName: 'Customer Care & Admin',
       senderRole: 'ADMIN',
     });
+    markConversationAsRead(currentConv.id, 'ADMIN');
 
     setAdminFloatingChatInput('');
     setAdminFloatingChatImage(null);
@@ -1176,26 +1211,36 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
     }, 350);
   };
 
-  const handleRemoveProductFromSeller = (productId: string) => {
+  const handleRemoveProductFromSeller = (productId: string, explicitSellerId?: string) => {
     const prod = products.find((p) => p.id === productId);
     if (!prod) return;
-    const targetEmail = (sellerSearchQuery.trim() || selectedSellerEmail).toLowerCase();
-    const matchedSeller = sellers.find(
-      (s) => (s.email && s.email.toLowerCase() === targetEmail) || s.userId === targetEmail || s.id === targetEmail
-    );
-    const sellerId = matchedSeller?.id || '';
-    
-    const updatedSellerIds = (prod.associatedSellerIds || []).filter(
-      (id) => id !== sellerId && id.toLowerCase() !== targetEmail
-    );
 
-    updateProduct(productId, {
-      associatedSellerIds: updatedSellerIds,
-    });
+    const rawTarget = (explicitSellerId || sellerSearchQuery.trim() || selectedSellerEmail || '').toLowerCase();
+    const matchedSeller = sellers.find(
+      (s) =>
+        (explicitSellerId && (s.id === explicitSellerId || s.userId === explicitSellerId)) ||
+        s.email?.toLowerCase() === rawTarget ||
+        s.userId?.toLowerCase() === rawTarget ||
+        s.id?.toLowerCase() === rawTarget ||
+        (rawTarget.length > 2 &&
+          ((s.shopName && s.shopName.toLowerCase().includes(rawTarget)) ||
+            (s.sellerName && s.sellerName.toLowerCase().includes(rawTarget)))) ||
+        (prod.sellerId && (s.id === prod.sellerId || s.userId === prod.sellerId))
+    );
+    const sellerId = matchedSeller?.id || explicitSellerId || prod.sellerId || '';
 
     if (sellerId) {
-      toggleSellerProductEligibility(productId, sellerId);
+      removeProductFromSeller(productId, sellerId);
+    } else {
+      const updatedSellerIds = (prod.associatedSellerIds || []).filter(
+        (id) => id.toLowerCase() !== rawTarget
+      );
+      updateProduct(productId, {
+        associatedSellerIds: updatedSellerIds,
+        ...(prod.sellerId?.toLowerCase() === rawTarget ? { sellerId: undefined } : {}),
+      });
     }
+
     triggerToast(`Removed "${prod.name}" from seller listings.`);
   };
 
@@ -2975,9 +3020,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
               if (currentSellerObj) {
                 const sId = currentSellerObj.id;
                 const uId = currentSellerObj.userId;
+                const sEmail = (currentSellerObj.email || '').toLowerCase();
                 const isAssociated =
                   (currentSellerObj.selectedProductIds && currentSellerObj.selectedProductIds.includes(p.id)) ||
-                  (p.sellerId && (p.sellerId === sId || (uId && p.sellerId === uId)));
+                  (p.sellerId && (p.sellerId === sId || (uId && p.sellerId === uId) || (sEmail && p.sellerId.toLowerCase() === sEmail))) ||
+                  (p.associatedSellerIds && p.associatedSellerIds.some((id) => id === sId || (uId && id === uId) || (sEmail && id.toLowerCase() === sEmail)));
                 return Boolean(isAssociated);
               }
 
@@ -2986,7 +3033,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
                 p.name.toLowerCase().includes(rawTarget) ||
                 p.category.toLowerCase().includes(rawTarget) ||
                 p.sku?.toLowerCase().includes(rawTarget) ||
-                Boolean(p.associatedSellerIds?.some((id) => id.toLowerCase().includes(rawTarget)))
+                Boolean(p.associatedSellerIds?.some((id) => id.toLowerCase().includes(rawTarget))) ||
+                (p.sellerId && p.sellerId.toLowerCase().includes(rawTarget))
               );
             });
 
@@ -3072,10 +3120,12 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
                             return nameA.localeCompare(nameB);
                           })
                           .map((s) => {
+                            const sEmail = (s.email || '').toLowerCase();
                             const count = products.filter(
                               (p) =>
                                 (s.selectedProductIds && s.selectedProductIds.includes(p.id)) ||
-                                (p.sellerId && (p.sellerId === s.id || (s.userId && p.sellerId === s.userId)))
+                                (p.sellerId && (p.sellerId === s.id || (s.userId && p.sellerId === s.userId) || (sEmail && p.sellerId.toLowerCase() === sEmail))) ||
+                                (p.associatedSellerIds && p.associatedSellerIds.some((id) => id === s.id || (s.userId && id === s.userId) || (sEmail && id.toLowerCase() === sEmail)))
                             ).length;
                             return (
                               <option key={s.id} value={s.email || s.id}>
@@ -3186,7 +3236,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
                           {/* Card Action Buttons */}
                           <div className="mt-2.5 pt-2 border-t border-slate-100 flex items-center justify-between gap-1.5">
                             <button
-                              onClick={() => handleRemoveProductFromSeller(prod.id)}
+                              onClick={() => handleRemoveProductFromSeller(prod.id, currentSellerObj?.id || prod.sellerId)}
                               className="px-2 py-0.5 border border-red-200 text-red-500 hover:bg-red-50 rounded text-[10px] font-bold uppercase transition-colors"
                             >
                               Remove

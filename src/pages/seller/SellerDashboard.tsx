@@ -68,10 +68,11 @@ import {
   Mail,
   Phone,
   ShoppingBag,
+  List,
 } from 'lucide-react';
 import { StatusBadge } from '../../components/common/Badge';
 import { Order, OrderStatus, WithdrawalMethod, Product, SellerWallet } from '../../types';
-import { listenToSellerRatingInFirestore } from '../../services/firebaseKyc';
+import { listenToSellerRatingInFirestore, isOrderDeleted } from '../../services/firebaseKyc';
 import { SellerTickerBar } from '../../components/seller/SellerTickerBar';
 import { TodayViewsCard } from '../../components/seller/TodayViewsCard';
 
@@ -85,6 +86,7 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
     switchUserRole,
     sellers,
     orders,
+    refreshOrders,
     products,
     categories,
     wallets,
@@ -104,6 +106,7 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
     updateSellerPassword,
     addProduct,
     toggleSellerProductEligibility,
+    removeProductFromSeller,
     addProductsToSeller,
     logoutSeller,
     sellerRemainingSeconds,
@@ -277,6 +280,7 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
   const [catalogMaxPrice, setCatalogMaxPrice] = useState('');
   const [catalogHideAdded, setCatalogHideAdded] = useState(false);
   const [catalogSelectedIds, setCatalogSelectedIds] = useState<string[]>([]);
+  const [catalogViewMode, setCatalogViewMode] = useState<'grid' | 'list'>('grid');
 
   // Unique categories list for Add Products view
   const availableCatalogCategories = useMemo(() => {
@@ -690,6 +694,7 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
   // Orders strictly assigned to this seller or direct orders belonging exclusively to this seller
   const sellerOrders = orders.filter((o) => {
     if (!currentSeller) return false;
+    if (isOrderDeleted(o.id)) return false;
 
     // Check if directly assigned to this seller by Admin
     const oSellerId = typeof o.assignedSellerId === 'string' ? o.assignedSellerId.toLowerCase().trim() : '';
@@ -812,13 +817,14 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
     }
   };
 
-  const handleRefreshOrders = () => {
+  const handleRefreshOrders = async () => {
     setRefreshingOrders(true);
-    setTimeout(() => {
-      setRefreshingOrders(false);
-      setPickupSuccessToast('✓ Orders refreshed successfully');
-      setTimeout(() => setPickupSuccessToast(null), 2000);
-    }, 500);
+    try {
+      await refreshOrders();
+    } catch {}
+    setRefreshingOrders(false);
+    setPickupSuccessToast('✓ Orders refreshed successfully');
+    setTimeout(() => setPickupSuccessToast(null), 2000);
   };
 
   const [walletRefreshCounter, setWalletRefreshCounter] = useState(0);
@@ -1031,12 +1037,28 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
   // Helper to reliably check if a product is associated with the current seller across all identifier formats
   const isProductAssociatedWithCurrentSeller = (p: Product) => {
     if (!currentSeller) return false;
+    const sId = currentSeller.id;
+    const uId = currentSeller.userId;
+    const sEmail = (currentSeller.email || '').toLowerCase();
+
     // 1. Direct creator (product was created specifically for/by this seller)
-    if (p.sellerId && (p.sellerId === currentSeller.id || (currentSeller.userId && p.sellerId === currentSeller.userId))) {
+    if (p.sellerId && (p.sellerId === sId || (uId && p.sellerId === uId) || (sEmail && p.sellerId.toLowerCase() === sEmail))) {
       return true;
     }
     // 2. Explicitly selected / listed by seller from the Master Catalog
     if (currentSeller.selectedProductIds && currentSeller.selectedProductIds.includes(p.id)) {
+      return true;
+    }
+    // 3. Associated seller IDs
+    if (
+      p.associatedSellerIds &&
+      p.associatedSellerIds.some(
+        (id) =>
+          id === sId ||
+          (uId && id === uId) ||
+          (sEmail && id.toLowerCase() === sEmail)
+      )
+    ) {
       return true;
     }
     return false;
@@ -1045,36 +1067,53 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
   // Products assigned or in catalog
   const assignedProducts = products.filter(isProductAssociatedWithCurrentSeller);
 
+// Fixed mixed counts between 4,800 and 6,500 (hardcoded independent of backend)
+const FIXED_CATEGORY_COUNTS: Record<string, string> = {
+  'Smart Home & Appliances': '5,840',
+  'Beauty & Skincare': '5,120',
+  'Electronics & Audio': '6,350',
+  'Fashion & Watches': '5,780',
+  'Furniture & Living': '4,920',
+  'Gaming & Consoles': '6,140',
+  'Laptops & Computers': '5,460',
+  'Graphics Cards & PC Parts': '5,230',
+  'Smartphones & Tablets': '6,580',
+  'Automotive & Tools': '4,890',
+  'Sports & Outdoor': '5,310',
+  'Books & Stationery': '5,040',
+  'Health & Wellness': '5,670',
+  'Toys & Baby Products': '5,190',
+  'Groceries & Gourmet': '6,210',
+  'Jewelry & Accessories': '5,430',
+  'Home & Kitchen': '5,820',
+  'Wearables & Smart Tech': '5,910',
+  'Clothing & Apparel': '6,050',
+  'Pet Supplies': '4,980',
+};
+
+const getFixedCategoryCount = (name: string, id: string): string => {
+  if (FIXED_CATEGORY_COUNTS[name]) {
+    return FIXED_CATEGORY_COUNTS[name];
+  }
+  const lower = (name || '').toLowerCase().trim();
+  for (const [key, val] of Object.entries(FIXED_CATEGORY_COUNTS)) {
+    if (key.toLowerCase().trim() === lower || lower.includes(key.toLowerCase().trim())) {
+      return val;
+    }
+  }
+  // Deterministic fallback in 5,000 - 6,500 range based on name hash
+  let hash = 0;
+  for (let i = 0; i < (name || '').length; i++) {
+    hash = (hash * 31 + name.charCodeAt(i)) % 1500;
+  }
+  return (5000 + hash).toLocaleString();
+};
+
   // Dynamic Category Wise Product Count based on actual Admin categories & catalog/shop products
   const categoryStats = useMemo(() => {
     return categories.map((cat) => {
       const catNameLower = (cat.name || '').toLowerCase().trim();
       const catSlugLower = (cat.slug || '').toLowerCase().trim();
-
-      // Find all products belonging to this category in the catalog
-      const matchingCatalog = products.filter((p) => {
-        if (!p) return false;
-        if (p.categoryId && p.categoryId === cat.id) return true;
-        const pCatName = (p.categoryName || '').toLowerCase().trim();
-        if (pCatName && catNameLower && (pCatName === catNameLower || pCatName === catSlugLower)) return true;
-        const pCat = (p.category || '').toLowerCase().trim();
-        if (pCat && catNameLower && (pCat === catNameLower || pCat === catSlugLower)) return true;
-        if (cat.id === 'cat_gaming' && (pCatName.includes('gaming') || p.name.toLowerCase().includes('gaming'))) return true;
-        if (
-          cat.id === 'cat_fashion' &&
-          (pCatName.includes('fashion') ||
-            pCatName.includes('wearables') ||
-            pCatName.includes('jewelry') ||
-            pCatName.includes('apparel') ||
-            p.categoryId === 'cat_wearables' ||
-            p.categoryId === 'cat_jewelry' ||
-            p.categoryId === 'cat_clothing' ||
-            p.categoryId === 'cat_men' ||
-            p.categoryId === 'cat_kids')
-        )
-          return true;
-        return false;
-      });
 
       // Find seller's own products in this category
       const matchingShop = assignedProducts.filter((p) => {
@@ -1101,16 +1140,14 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
         return false;
       });
 
-      const catalogCount = matchingCatalog.length > 0 ? matchingCatalog.length : (cat.itemCount || 0);
-
       return {
         id: cat.id,
         name: cat.name,
-        catalogCount,
+        catalogCount: getFixedCategoryCount(cat.name, cat.id),
         shopCount: matchingShop.length,
       };
     });
-  }, [categories, products, assignedProducts]);
+  }, [categories, assignedProducts]);
 
   // Category card view toggle
   const [showAllCategories, setShowAllCategories] = useState(false);
@@ -2817,6 +2854,21 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
                                 +${estimatedProfit}
                               </span>
                             </div>
+
+                            <div className="pt-2 border-t border-slate-100 flex items-center justify-between">
+                              <span className="text-[10px] text-slate-400 font-medium">In your shop</span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (currentSeller) {
+                                    removeProductFromSeller(p.id, currentSeller.id);
+                                  }
+                                }}
+                                className="text-[10px] text-red-500 hover:text-red-700 hover:bg-red-50 px-2 py-0.5 rounded font-semibold border border-red-200 transition-colors cursor-pointer"
+                              >
+                                Remove
+                              </button>
+                            </div>
                           </div>
                         </div>
                       );
@@ -3051,146 +3103,145 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
                 )}
               </div>
 
-              {/* Filter / Toggle Bar: "Hide added products" checkbox + Select All button */}
-              <div className="flex items-center justify-between text-xs pt-0.5">
-                {/* Hide added products Checkbox */}
-                <label className="flex items-center gap-2 text-slate-700 font-medium cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={catalogHideAdded}
-                    onChange={(e) => setCatalogHideAdded(e.target.checked)}
-                    className="w-4 h-4 text-[#EE4932] border-slate-300 rounded focus:ring-[#EE4932] accent-[#EE4932] cursor-pointer"
-                  />
-                  <span>Hide added products</span>
-                </label>
+              {/* Filter / Toggle Bar & Product Cards (Grid & List View) */}
+              {(() => {
+                const maxAllowed = currentSeller?.maxAllowedProducts || 100;
+                const alreadyAddedCount = (currentSeller?.selectedProductIds || []).length;
+                const remainingSlots = Math.max(0, maxAllowed - alreadyAddedCount);
 
-                {/* Select All / Deselect All Toggle Button */}
-                {(() => {
-                  const maxAllowed = currentSeller?.maxAllowedProducts || 100;
-                  const alreadyAddedCount = (currentSeller?.selectedProductIds || []).length;
-                  const remainingSlots = Math.max(0, maxAllowed - alreadyAddedCount);
+                // Sort products newest first so admin's newly uploaded products are at the top
+                const sortedCatalogList = [...products].sort((a, b) => {
+                  const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+                  const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+                  if (timeB !== timeA) return timeB - timeA;
+                  return (b.id || '').localeCompare(a.id || '');
+                });
 
-                  // Sort products newest first so admin's newly uploaded products are at the top
-                  const sortedCatalogList = [...products].sort((a, b) => {
-                    const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-                    const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-                    if (timeB !== timeA) return timeB - timeA;
-                    return (b.id || '').localeCompare(a.id || '');
-                  });
+                const filteredProducts = sortedCatalogList.filter((p) => {
+                  const isAlreadyAdded = isProductAssociatedWithCurrentSeller(p);
+                  if (catalogHideAdded && isAlreadyAdded) return false;
 
-                  const availableToSelect = sortedCatalogList.filter((p) => {
-                    const isAlreadyAdded = isProductAssociatedWithCurrentSeller(p);
-                    if (isAlreadyAdded) return false;
-                    if (catalogHideAdded && isAlreadyAdded) return false;
+                  // Search filter
+                  if (catalogSearch.trim()) {
+                    const q = catalogSearch.toLowerCase();
+                    const matchName = p.name.toLowerCase().includes(q);
+                    const matchCategory = p.categoryName?.toLowerCase().includes(q);
+                    if (!matchName && !matchCategory) return false;
+                  }
 
-                    // Search filter
-                    if (catalogSearch.trim()) {
-                      const q = catalogSearch.toLowerCase();
-                      const matchName = p.name.toLowerCase().includes(q);
-                      const matchCategory = p.categoryName?.toLowerCase().includes(q);
-                      if (!matchName && !matchCategory) return false;
+                  // Category filter
+                  if (catalogCategoryFilter) {
+                    if ((p.categoryName || '').toLowerCase() !== catalogCategoryFilter.toLowerCase()) {
+                      return false;
                     }
+                  }
 
-                    // Category filter
-                    if (catalogCategoryFilter) {
-                      if ((p.categoryName || '').toLowerCase() !== catalogCategoryFilter.toLowerCase()) {
-                        return false;
-                      }
+                  // Min price filter
+                  if (catalogMinPrice !== '') {
+                    const min = parseFloat(catalogMinPrice);
+                    if (!isNaN(min) && p.price < min) return false;
+                  }
+
+                  // Max price filter
+                  if (catalogMaxPrice !== '') {
+                    const max = parseFloat(catalogMaxPrice);
+                    if (!isNaN(max) && p.price > max) return false;
+                  }
+
+                  return true;
+                });
+
+                const availableToSelect = filteredProducts.filter(
+                  (p) => !isProductAssociatedWithCurrentSeller(p)
+                );
+                const limitToSelect = Math.min(availableToSelect.length, remainingSlots);
+                const isAllSelected =
+                  availableToSelect.length > 0 &&
+                  catalogSelectedIds.length > 0 &&
+                  (limitToSelect === 0 || catalogSelectedIds.length >= limitToSelect);
+
+                const handleToggleSelectAll = () => {
+                  if (isAllSelected) {
+                    setCatalogSelectedIds([]);
+                  } else {
+                    if (remainingSlots <= 0) {
+                      alert(`Product limit reached (${maxAllowed} max). Please contact admin to increase your limit.`);
+                      return;
                     }
+                    const toSelect = availableToSelect.slice(0, remainingSlots).map((p) => p.id);
+                    setCatalogSelectedIds(toSelect);
+                  }
+                };
 
-                    // Min price filter
-                    if (catalogMinPrice !== '') {
-                      const min = parseFloat(catalogMinPrice);
-                      if (!isNaN(min) && p.price < min) return false;
-                    }
+                return (
+                  <>
+                    {/* Action Bar: Select All Checkbox + Hide added products + View Toggle (Grid / List) */}
+                    <div className="flex flex-wrap items-center justify-between gap-2.5 text-xs py-2 px-3 bg-white rounded-2xl border border-slate-200 shadow-2xs">
+                      <div className="flex flex-wrap items-center gap-4">
+                        {/* Select All with a real tick/checkbox in front */}
+                        <label className="flex items-center gap-2 text-slate-800 font-bold cursor-pointer select-none">
+                          <input
+                            type="checkbox"
+                            checked={isAllSelected}
+                            disabled={availableToSelect.length === 0 || remainingSlots <= 0}
+                            onChange={handleToggleSelectAll}
+                            className="w-4 h-4 text-[#EE4932] border-slate-300 rounded focus:ring-[#EE4932] accent-[#EE4932] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+                          />
+                          <span className="flex items-center gap-1.5">
+                            <span>Select all</span>
+                            {limitToSelect > 0 && (
+                              <span className="text-[11px] font-semibold text-slate-500 bg-slate-100 px-1.5 py-0.2 rounded-md">
+                                {catalogSelectedIds.length}/{limitToSelect}
+                              </span>
+                            )}
+                          </span>
+                        </label>
 
-                    // Max price filter
-                    if (catalogMaxPrice !== '') {
-                      const max = parseFloat(catalogMaxPrice);
-                      if (!isNaN(max) && p.price > max) return false;
-                    }
+                        {/* Hide added products Checkbox */}
+                        <label className="flex items-center gap-1.5 text-slate-600 font-medium cursor-pointer select-none border-l border-slate-200 pl-3">
+                          <input
+                            type="checkbox"
+                            checked={catalogHideAdded}
+                            onChange={(e) => setCatalogHideAdded(e.target.checked)}
+                            className="w-4 h-4 text-[#EE4932] border-slate-300 rounded focus:ring-[#EE4932] accent-[#EE4932] cursor-pointer"
+                          />
+                          <span>Hide added</span>
+                        </label>
+                      </div>
 
-                    return true;
-                  });
+                      {/* View Switcher: Grid vs List Buttons */}
+                      <div className="flex items-center bg-slate-100 p-0.5 rounded-xl border border-slate-200/80">
+                        <button
+                          type="button"
+                          onClick={() => setCatalogViewMode('grid')}
+                          className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                            catalogViewMode === 'grid'
+                              ? 'bg-white text-[#EE4932] shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                          title="Grid View"
+                        >
+                          <LayoutGrid className="w-3.5 h-3.5" />
+                          <span>Grid</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setCatalogViewMode('list')}
+                          className={`px-2.5 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 transition-all cursor-pointer ${
+                            catalogViewMode === 'list'
+                              ? 'bg-white text-[#EE4932] shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                          title="List View"
+                        >
+                          <List className="w-3.5 h-3.5" />
+                          <span>List</span>
+                        </button>
+                      </div>
+                    </div>
 
-                  const limitToSelect = Math.min(availableToSelect.length, remainingSlots);
-                  const isAllSelected =
-                    catalogSelectedIds.length > 0 &&
-                    (limitToSelect === 0 || catalogSelectedIds.length >= limitToSelect);
-
-                  return (
-                    <button
-                      type="button"
-                      disabled={availableToSelect.length === 0 || remainingSlots <= 0}
-                      onClick={() => {
-                        if (isAllSelected) {
-                          setCatalogSelectedIds([]);
-                        } else {
-                          if (remainingSlots <= 0) {
-                            alert(`Product limit reached (${maxAllowed} max). Please contact admin to increase your limit.`);
-                            return;
-                          }
-                          const toSelect = availableToSelect.slice(0, remainingSlots).map((p) => p.id);
-                          setCatalogSelectedIds(toSelect);
-                        }
-                      }}
-                      className="text-xs font-semibold text-[#EE4932] hover:text-[#d83a24] cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
-                    >
-                      {isAllSelected
-                        ? 'Deselect all'
-                        : `Select all (${limitToSelect} items)`}
-                    </button>
-                  );
-                })()}
-              </div>
-
-              {/* Product Cards List (Matching the user's reference image) */}
-              <div className="space-y-2.5 pt-1">
-                {(() => {
-                  // Keep products sorted newest first so admin's newly added products appear on top
-                  const sortedProductsList = [...products].sort((a, b) => {
-                    const timeA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
-                    const timeB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
-                    if (timeB !== timeA) return timeB - timeA;
-                    return (b.id || '').localeCompare(a.id || '');
-                  });
-
-                  const filteredProducts = sortedProductsList.filter((p) => {
-                    const isAlreadyAdded = isProductAssociatedWithCurrentSeller(p);
-                    if (catalogHideAdded && isAlreadyAdded) return false;
-
-                    // Search filter
-                    if (catalogSearch.trim()) {
-                      const q = catalogSearch.toLowerCase();
-                      const matchName = p.name.toLowerCase().includes(q);
-                      const matchCategory = p.categoryName?.toLowerCase().includes(q);
-                      if (!matchName && !matchCategory) return false;
-                    }
-
-                    // Category filter
-                    if (catalogCategoryFilter) {
-                      if ((p.categoryName || '').toLowerCase() !== catalogCategoryFilter.toLowerCase()) {
-                        return false;
-                      }
-                    }
-
-                    // Min price filter
-                    if (catalogMinPrice !== '') {
-                      const min = parseFloat(catalogMinPrice);
-                      if (!isNaN(min) && p.price < min) return false;
-                    }
-
-                    // Max price filter
-                    if (catalogMaxPrice !== '') {
-                      const max = parseFloat(catalogMaxPrice);
-                      if (!isNaN(max) && p.price > max) return false;
-                    }
-
-                    return true;
-                  });
-
-                  if (filteredProducts.length === 0) {
-                    return (
+                    {/* Products Display (Grid vs List) */}
+                    {filteredProducts.length === 0 ? (
                       <div className="py-12 px-4 text-center bg-white rounded-2xl border border-slate-200 text-slate-500 text-xs space-y-2">
                         <p className="font-bold text-slate-700">No products found</p>
                         <p className="text-slate-400 text-[11px]">
@@ -3212,88 +3263,172 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
                           </button>
                         )}
                       </div>
-                    );
-                  }
-
-                  return filteredProducts.map((p) => {
-                    const isAlreadyAdded = isProductAssociatedWithCurrentSeller(p);
-                    const isChecked = catalogSelectedIds.includes(p.id);
-                    const estimatedProfit = (p.price * 0.21).toFixed(2);
-
-                    return (
-                      <div
-                        key={p.id}
-                        onClick={() => {
-                          if (isAlreadyAdded) return;
-                          const maxAllowed = currentSeller?.maxAllowedProducts || 100;
-                          const alreadyAddedCount = (currentSeller?.selectedProductIds || []).length;
+                    ) : catalogViewMode === 'grid' ? (
+                      /* ================= GRID VIEW ================= */
+                      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3 pt-1">
+                        {filteredProducts.map((p) => {
+                          const isAlreadyAdded = isProductAssociatedWithCurrentSeller(p);
                           const isChecked = catalogSelectedIds.includes(p.id);
-                          if (!isChecked && (alreadyAddedCount + catalogSelectedIds.length >= maxAllowed)) {
-                            alert(`Product limit reached (${maxAllowed} max). You cannot select more products.`);
-                            return;
-                          }
-                          setCatalogSelectedIds((prev) =>
-                            prev.includes(p.id) ? prev.filter((id) => id !== p.id) : [...prev, p.id]
-                          );
-                        }}
-                        className={`bg-white rounded-2xl p-3 border transition-all flex items-center justify-between gap-3 shadow-xs ${
-                          isAlreadyAdded
-                            ? 'border-slate-100 bg-slate-50/50 cursor-default'
-                            : isChecked
-                            ? 'border-[#EE4932] ring-1 ring-[#EE4932] cursor-pointer'
-                            : 'border-slate-200/90 hover:border-slate-300 cursor-pointer'
-                        }`}
-                      >
-                        {/* Left: Product Image + Info */}
-                        <div className="flex items-center gap-3 min-w-0 flex-1">
-                          <img
-                            src={p.images[0] || 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=200'}
-                            alt={p.name}
-                            className="w-14 h-14 rounded-xl object-contain bg-[#F8F9FA] border border-slate-100 shrink-0 p-1"
-                          />
-                          <div className="min-w-0 flex-1">
-                            <h3 className="font-semibold text-xs text-slate-900 line-clamp-1">
-                              {p.name}
-                            </h3>
-                            {p.categoryName && (
-                              <span className="text-[10px] text-slate-400 block truncate">
-                                {p.categoryName}
-                              </span>
-                            )}
-                            <div className="flex items-center gap-2 mt-1">
-                              <span className="font-extrabold text-sm text-slate-900">
-                                ${p.price.toFixed(2)}
-                              </span>
-                              <span className="text-xs font-semibold text-[#10B981]">
-                                +${estimatedProfit}
-                              </span>
-                            </div>
-                          </div>
-                        </div>
+                          const estimatedProfit = (p.price * 0.21).toFixed(2);
 
-                        {/* Right: State Checkbox OR "Added" Badge */}
-                        <div className="shrink-0 flex items-center justify-center pl-2">
-                          {isAlreadyAdded ? (
-                            <span className="px-2.5 py-1 bg-slate-100 text-slate-500 font-semibold text-[11px] rounded-lg border border-slate-200">
-                              Added
-                            </span>
-                          ) : (
+                          return (
                             <div
-                              className={`w-5 h-5 rounded-md border flex items-center justify-center transition-colors ${
-                                isChecked
-                                  ? 'bg-[#EE4932] border-[#EE4932] text-white'
-                                  : 'border-slate-300 bg-white hover:border-slate-400'
+                              key={p.id}
+                              onClick={() => {
+                                if (isAlreadyAdded) return;
+                                if (!isChecked && alreadyAddedCount + catalogSelectedIds.length >= maxAllowed) {
+                                  alert(`Product limit reached (${maxAllowed} max). You cannot select more products.`);
+                                  return;
+                                }
+                                setCatalogSelectedIds((prev) =>
+                                  prev.includes(p.id) ? prev.filter((id) => id !== p.id) : [...prev, p.id]
+                                );
+                              }}
+                              className={`bg-white rounded-2xl p-3 border transition-all flex flex-col justify-between relative group shadow-xs select-none ${
+                                isAlreadyAdded
+                                  ? 'border-slate-100 bg-slate-50/60 cursor-default opacity-80'
+                                  : isChecked
+                                  ? 'border-[#EE4932] ring-2 ring-[#EE4932]/30 bg-orange-50/20 cursor-pointer shadow-sm'
+                                  : 'border-slate-200/90 hover:border-slate-300 hover:shadow-xs cursor-pointer'
                               }`}
                             >
-                              {isChecked && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                              {/* Top Indicators: Profit tag on left, Checkbox/Added on right */}
+                              <div className="flex items-center justify-between gap-1 mb-2">
+                                <span className="px-1.5 py-0.5 bg-emerald-50 text-emerald-700 font-bold text-[10px] rounded-md border border-emerald-200">
+                                  +${estimatedProfit}
+                                </span>
+
+                                {isAlreadyAdded ? (
+                                  <span className="px-2 py-0.5 bg-slate-100 text-slate-500 font-bold text-[10px] rounded-md border border-slate-200">
+                                    Added
+                                  </span>
+                                ) : (
+                                  <div
+                                    className={`w-5 h-5 rounded-md border flex items-center justify-center transition-all ${
+                                      isChecked
+                                        ? 'bg-[#EE4932] border-[#EE4932] text-white shadow-2xs'
+                                        : 'border-slate-300 bg-white group-hover:border-slate-400'
+                                    }`}
+                                  >
+                                    {isChecked && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                                  </div>
+                                )}
+                              </div>
+
+                              {/* Product Image */}
+                              <div className="w-full aspect-square bg-[#F8F9FA] rounded-xl flex items-center justify-center overflow-hidden p-2 mb-2 border border-slate-100">
+                                <img
+                                  src={p.images[0] || 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=200'}
+                                  alt={p.name}
+                                  className="w-full h-full object-contain group-hover:scale-105 transition-transform duration-200"
+                                />
+                              </div>
+
+                              {/* Details */}
+                              <div className="space-y-1">
+                                {p.categoryName && (
+                                  <span className="text-[10px] font-medium text-slate-400 block truncate">
+                                    {p.categoryName}
+                                  </span>
+                                )}
+                                <h3 className="font-bold text-slate-900 text-xs line-clamp-2 min-h-[32px] leading-snug">
+                                  {p.name}
+                                </h3>
+                                <div className="flex items-center justify-between pt-1 border-t border-slate-100">
+                                  <span className="font-extrabold text-slate-900 text-sm">
+                                    ${p.price.toFixed(2)}
+                                  </span>
+                                  <span className="text-[10px] font-bold text-emerald-600">
+                                    +21% profit
+                                  </span>
+                                </div>
+                              </div>
                             </div>
-                          )}
-                        </div>
+                          );
+                        })}
                       </div>
-                    );
-                  });
-                })()}
-              </div>
+                    ) : (
+                      /* ================= LIST VIEW ================= */
+                      <div className="space-y-2.5 pt-1">
+                        {filteredProducts.map((p) => {
+                          const isAlreadyAdded = isProductAssociatedWithCurrentSeller(p);
+                          const isChecked = catalogSelectedIds.includes(p.id);
+                          const estimatedProfit = (p.price * 0.21).toFixed(2);
+
+                          return (
+                            <div
+                              key={p.id}
+                              onClick={() => {
+                                if (isAlreadyAdded) return;
+                                if (!isChecked && alreadyAddedCount + catalogSelectedIds.length >= maxAllowed) {
+                                  alert(`Product limit reached (${maxAllowed} max). You cannot select more products.`);
+                                  return;
+                                }
+                                setCatalogSelectedIds((prev) =>
+                                  prev.includes(p.id) ? prev.filter((id) => id !== p.id) : [...prev, p.id]
+                                );
+                              }}
+                              className={`bg-white rounded-2xl p-3 border transition-all flex items-center justify-between gap-3 shadow-xs select-none ${
+                                isAlreadyAdded
+                                  ? 'border-slate-100 bg-slate-50/50 cursor-default'
+                                  : isChecked
+                                  ? 'border-[#EE4932] ring-1 ring-[#EE4932] cursor-pointer'
+                                  : 'border-slate-200/90 hover:border-slate-300 cursor-pointer'
+                              }`}
+                            >
+                              {/* Left: Product Image + Info */}
+                              <div className="flex items-center gap-3 min-w-0 flex-1">
+                                <img
+                                  src={p.images[0] || 'https://images.unsplash.com/photo-1523275335684-37898b6baf30?w=200'}
+                                  alt={p.name}
+                                  className="w-14 h-14 rounded-xl object-contain bg-[#F8F9FA] border border-slate-100 shrink-0 p-1"
+                                />
+                                <div className="min-w-0 flex-1">
+                                  <h3 className="font-semibold text-xs text-slate-900 line-clamp-1">
+                                    {p.name}
+                                  </h3>
+                                  {p.categoryName && (
+                                    <span className="text-[10px] text-slate-400 block truncate">
+                                      {p.categoryName}
+                                    </span>
+                                  )}
+                                  <div className="flex items-center gap-2 mt-1">
+                                    <span className="font-extrabold text-sm text-slate-900">
+                                      ${p.price.toFixed(2)}
+                                    </span>
+                                    <span className="text-xs font-semibold text-[#10B981]">
+                                      +${estimatedProfit}
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Right: State Checkbox OR "Added" Badge */}
+                              <div className="shrink-0 flex items-center justify-center pl-2">
+                                {isAlreadyAdded ? (
+                                  <span className="px-2.5 py-1 bg-slate-100 text-slate-500 font-semibold text-[11px] rounded-lg border border-slate-200">
+                                    Added
+                                  </span>
+                                ) : (
+                                  <div
+                                    className={`w-5 h-5 rounded-md border flex items-center justify-center transition-colors ${
+                                      isChecked
+                                        ? 'bg-[#EE4932] border-[#EE4932] text-white'
+                                        : 'border-slate-300 bg-white hover:border-slate-400'
+                                    }`}
+                                  >
+                                    {isChecked && <Check className="w-3.5 h-3.5 stroke-[3]" />}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </>
+                );
+              })()}
 
               {/* Floating Bottom Corner "Add Selected" Button */}
               {catalogSelectedIds.length > 0 && (
@@ -5556,7 +5691,13 @@ export const SellerDashboard: React.FC<SellerDashboardProps> = ({ onNavigate }) 
 
                       <button
                         type="button"
-                        onClick={() => toggleSellerProductEligibility(p.id, targetSellerId)}
+                        onClick={() => {
+                          if (isListed) {
+                            removeProductFromSeller(p.id, targetSellerId);
+                          } else {
+                            toggleSellerProductEligibility(p.id, targetSellerId);
+                          }
+                        }}
                         className={`px-3 py-1.5 rounded-xl font-bold text-xs flex items-center gap-1.5 transition-all shrink-0 cursor-pointer shadow-xs ${
                           isListed
                             ? 'bg-emerald-600 hover:bg-emerald-700 text-white'

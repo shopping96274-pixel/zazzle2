@@ -250,16 +250,7 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate }) => {
         </div>
 
         <div className="mt-12 pt-6 border-t border-slate-800 text-xs text-slate-500 flex flex-col sm:flex-row justify-between items-center gap-4">
-          <p
-            onClick={(e) => {
-              // Stealth triple-click trigger for owner to access admin without any visible button
-              if (e.detail === 3) {
-                onNavigate('admin');
-              }
-            }}
-            className="cursor-default select-none"
-            title={`${storeName || 'Zazzel'} Store`}
-          >
+          <p className="cursor-default select-none text-slate-500">
             © {new Date().getFullYear()} {storeName || 'Zazzel'} Shopping Store. All rights reserved.
           </p>
           <div className="flex flex-wrap items-center gap-4 text-slate-400 text-xs">

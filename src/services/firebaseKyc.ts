@@ -31,25 +31,53 @@ export function recordDeletedSellerId(sellerId: string): void {
   } catch {}
 }
 
-export function isOrderDeleted(orderId: string): boolean {
+const deletedOrderIdsSet = new Set<string>();
+
+// Bootstrap deleted order IDs from localStorage
+if (typeof localStorage !== 'undefined') {
   try {
     const raw = localStorage.getItem(DELETED_ORDERS_KEY);
+    if (raw) {
+      const list: string[] = JSON.parse(raw);
+      if (Array.isArray(list)) {
+        list.forEach((id) => deletedOrderIdsSet.add(id));
+      }
+    }
+  } catch {}
+}
+
+export function isOrderDeleted(orderId: string): boolean {
+  if (!orderId) return false;
+  if (deletedOrderIdsSet.has(orderId)) return true;
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(DELETED_ORDERS_KEY) : null;
     if (!raw) return false;
     const list: string[] = JSON.parse(raw);
-    return list.includes(orderId);
+    if (Array.isArray(list) && list.includes(orderId)) {
+      deletedOrderIdsSet.add(orderId);
+      return true;
+    }
+    return false;
   } catch {
     return false;
   }
 }
 
 export function recordDeletedOrderId(orderId: string): void {
+  if (!orderId) return;
+  deletedOrderIdsSet.add(orderId);
   try {
-    const raw = localStorage.getItem(DELETED_ORDERS_KEY);
-    const list: string[] = raw ? JSON.parse(raw) : [];
-    if (!list.includes(orderId)) {
-      list.push(orderId);
-      localStorage.setItem(DELETED_ORDERS_KEY, JSON.stringify(list));
-    }
+    const list = Array.from(deletedOrderIdsSet);
+    localStorage.setItem(DELETED_ORDERS_KEY, JSON.stringify(list));
+  } catch {}
+}
+
+export function unmarkDeletedOrderId(orderId: string): void {
+  if (!orderId) return;
+  deletedOrderIdsSet.delete(orderId);
+  try {
+    const list = Array.from(deletedOrderIdsSet);
+    localStorage.setItem(DELETED_ORDERS_KEY, JSON.stringify(list));
   } catch {}
 }
 
@@ -411,7 +439,7 @@ export async function saveSellerKycToFirestore(sellerData: {
       rating: starRatingVal,
       starRating: starRatingVal,
       totalSalesVolume: sellerData.totalSalesVolume ?? 0,
-      ...(sellerData.selectedProductIds ? { selectedProductIds: sellerData.selectedProductIds } : {}),
+      ...(Array.isArray(sellerData.selectedProductIds) ? { selectedProductIds: sellerData.selectedProductIds } : (sellerData.selectedProductIds ? { selectedProductIds: sellerData.selectedProductIds } : {})),
       kycSubmittedAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
@@ -1062,6 +1090,28 @@ export async function saveOrderToFirestore(orderData: any): Promise<void> {
 }
 
 /**
+ * Fetches all active non-deleted orders from Firestore
+ */
+export async function fetchFirestoreOrders(): Promise<any[]> {
+  const db = getFirebaseFirestore();
+  if (!db || !isFirebaseConfigured()) return [];
+  try {
+    const ordersCol = collection(db, 'orders');
+    const snapshot = await getDocs(ordersCol);
+    const firestoreOrders: any[] = [];
+    snapshot.forEach((docSnap) => {
+      if (!isOrderDeleted(docSnap.id)) {
+        firestoreOrders.push({ id: docSnap.id, ...docSnap.data() });
+      }
+    });
+    return firestoreOrders;
+  } catch (err) {
+    console.warn('[Firestore] Failed to fetch orders directly:', err);
+    return [];
+  }
+}
+
+/**
  * Real-time listener for orders collection in Firestore.
  */
 export function listenToFirestoreOrders(
@@ -1089,6 +1139,43 @@ export function listenToFirestoreOrders(
     );
   } catch (err) {
     console.warn('[Firestore] Failed to start orders listener:', err);
+    return () => {};
+  }
+}
+
+/**
+ * Real-time listener for deleted_orders collection in Firestore.
+ * Ensures orders deleted by Admin in one browser instantly disappear from all seller dashboards in other browsers/devices.
+ */
+export function listenToFirestoreDeletedOrders(
+  onUpdate: (deletedIds: string[]) => void
+): () => void {
+  const db = getFirebaseFirestore();
+  if (!db || !isFirebaseConfigured()) return () => {};
+
+  try {
+    const deletedCol = collection(db, 'deleted_orders');
+    return onSnapshot(
+      deletedCol,
+      (snapshot) => {
+        const ids: string[] = [];
+        snapshot.forEach((docSnap) => {
+          const id = docSnap.id;
+          if (id) {
+            ids.push(id);
+            recordDeletedOrderId(id);
+          }
+        });
+        if (ids.length > 0) {
+          onUpdate(ids);
+        }
+      },
+      (err) => {
+        console.warn('[Firestore] Deleted orders listener notice:', err);
+      }
+    );
+  } catch (err) {
+    console.warn('[Firestore] Failed to start deleted orders listener:', err);
     return () => {};
   }
 }
@@ -1350,6 +1437,18 @@ export async function deleteOrderFromFirestore(orderId: string): Promise<void> {
   if (!db || !isFirebaseConfigured()) return;
 
   try {
+    // Record into globally tracked deleted_orders collection so all seller and customer devices immediately receive deletion
+    try {
+      await setDoc(
+        doc(db, 'deleted_orders', orderId),
+        {
+          orderId,
+          deletedAt: new Date().toISOString(),
+        },
+        { merge: true }
+      );
+    } catch {}
+
     // 3. Wipe subcollections
     const knownSubcollections = ['items', 'tracking', 'status_history', 'notes', 'invoices'];
     for (const sub of knownSubcollections) {
