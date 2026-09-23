@@ -156,6 +156,10 @@ interface StoreContextType {
   sellerRemainingSeconds: number;
   sessionNotice: string | null;
   setSessionNotice: (msg: string | null) => void;
+  adminSessionNotice: string | null;
+  sellerSessionNotice: string | null;
+  clearSellerSessionNotice: () => void;
+  clearAdminSessionNotice: () => void;
   loginAdmin: (email?: string, password?: string) => Promise<{ success: boolean; message: string }>;
   resetAdminPassword: (pin: string, newPassword: string) => Promise<{ success: boolean; message: string }>;
   logoutAdmin: (reason?: string) => void;
@@ -800,6 +804,25 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [sessionNotice, setSessionNotice] = useState<string | null>(() => {
     return localStorage.getItem('nexus_session_notice') || null;
   });
+
+  const [adminSessionNotice, setAdminSessionNotice] = useState<string | null>(() => {
+    return localStorage.getItem('nexus_admin_session_notice') || null;
+  });
+
+  const [sellerSessionNotice, setSellerSessionNotice] = useState<string | null>(() => {
+    return localStorage.getItem('nexus_seller_session_notice') || null;
+  });
+
+  // Purge any leaked legacy admin notice from shared storage
+  useEffect(() => {
+    try {
+      const rawNotice = localStorage.getItem('nexus_session_notice');
+      if (rawNotice && rawNotice.toLowerCase().includes('admin')) {
+        localStorage.removeItem('nexus_session_notice');
+        setSessionNotice(null);
+      }
+    } catch {}
+  }, []);
 
   const [adminRemainingSeconds, setAdminRemainingSeconds] = useState<number>(() => {
     try {
@@ -2310,7 +2333,8 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setAdminRemainingSeconds(0);
     setCurrentUser(createGuestUser());
     if (reason) {
-      localStorage.setItem('nexus_session_notice', reason);
+      localStorage.setItem('nexus_admin_session_notice', reason);
+      setAdminSessionNotice(reason);
       setSessionNotice(reason);
     }
   };
@@ -2323,9 +2347,25 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     setSellerRemainingSeconds(0);
     setCurrentUser(createGuestUser());
     if (reason) {
-      localStorage.setItem('nexus_session_notice', reason);
-      setSessionNotice(reason);
+      localStorage.setItem('nexus_seller_session_notice', reason);
+      setSellerSessionNotice(reason);
     }
+  };
+
+  const clearSellerSessionNotice = () => {
+    setSellerSessionNotice(null);
+    try {
+      localStorage.removeItem('nexus_seller_session_notice');
+    } catch {}
+  };
+
+  const clearAdminSessionNotice = () => {
+    setAdminSessionNotice(null);
+    setSessionNotice(null);
+    try {
+      localStorage.removeItem('nexus_admin_session_notice');
+      localStorage.removeItem('nexus_session_notice');
+    } catch {}
   };
 
   // Generic / Customer Logout
@@ -6545,6 +6585,10 @@ export const StoreProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         sellerRemainingSeconds,
         sessionNotice,
         setSessionNotice,
+        adminSessionNotice,
+        sellerSessionNotice,
+        clearSellerSessionNotice,
+        clearAdminSessionNotice,
         loginAdmin,
         resetAdminPassword,
         logoutAdmin,

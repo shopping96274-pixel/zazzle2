@@ -187,7 +187,8 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
     resetAdminPassword,
     logoutAdmin,
     adminRemainingSeconds,
-    sessionNotice,
+    adminSessionNotice,
+    clearAdminSessionNotice,
     sellerLoginSessions,
     refreshSellerLoginSessions,
     deleteSellerLoginSessionById,
@@ -1400,13 +1401,23 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({ onNavigate }) =>
           </div>
 
           {/* Session Notice / Expiration Alert */}
-          {sessionNotice && (
-            <div className="bg-amber-500/15 border border-amber-500/30 rounded-xl p-2.5 text-amber-200 text-xs flex items-start gap-2 animate-in fade-in">
-              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-              <div className="flex-1 text-[11px] leading-relaxed">
-                <span className="font-semibold block">Session Notice:</span>
-                <span>{sessionNotice}</span>
+          {adminSessionNotice && (
+            <div className="bg-amber-500/15 border border-amber-500/30 rounded-xl p-2.5 text-amber-200 text-xs flex items-start justify-between gap-2 animate-in fade-in">
+              <div className="flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div className="flex-1 text-[11px] leading-relaxed">
+                  <span className="font-semibold block">Session Notice:</span>
+                  <span>{adminSessionNotice}</span>
+                </div>
               </div>
+              <button
+                type="button"
+                onClick={clearAdminSessionNotice}
+                className="text-amber-400/70 hover:text-amber-200 p-0.5 rounded transition-colors"
+                title="Dismiss notice"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             </div>
           )}
 

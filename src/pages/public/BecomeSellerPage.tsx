@@ -52,7 +52,8 @@ export const BecomeSellerPage: React.FC<BecomeSellerPageProps> = ({
     currentUser,
     switchUserRole,
     sellers,
-    sessionNotice,
+    sellerSessionNotice,
+    clearSellerSessionNotice,
     storeContacts,
     invitationCode: activeDatabaseInviteCode,
     validateInvitationCode,
@@ -671,14 +672,24 @@ export const BecomeSellerPage: React.FC<BecomeSellerPageProps> = ({
           {/* ======================================================== */}
           {authMode === 'login' ? (
             <form onSubmit={handleSellerLogin} className="space-y-4 pt-1">
-              {/* Session Expiry or Timeout Notice */}
-              {sessionNotice && (
-                <div className="p-3.5 bg-amber-500/10 border border-amber-400/20 rounded-xl text-xs text-amber-300 flex items-start gap-2.5">
-                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                  <div>
-                    <span className="font-bold block text-amber-200">Session Info:</span>
-                    <span>{sessionNotice}</span>
+              {/* Session Expiry or Timeout Notice (Strictly Seller Only, Never Admin) */}
+              {sellerSessionNotice && !sellerSessionNotice.toLowerCase().includes('admin') && (
+                <div className="p-3.5 bg-amber-500/10 border border-amber-400/20 rounded-xl text-xs text-amber-300 flex items-start justify-between gap-2.5">
+                  <div className="flex items-start gap-2.5">
+                    <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold block text-amber-200">Session Info:</span>
+                      <span>{sellerSessionNotice}</span>
+                    </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={clearSellerSessionNotice}
+                    className="text-amber-400/70 hover:text-amber-200 p-0.5 rounded transition-colors"
+                    title="Dismiss notice"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
                 </div>
               )}
 
